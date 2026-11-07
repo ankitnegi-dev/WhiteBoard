@@ -141,31 +141,50 @@ class WhiteboardApp:
 
     def _update_connect_mode(self):
         mode = self.connect_mode.get()
-        parent = self.entry_room_code.master
-        row_widgets = parent.grid_slaves(row=self.room_code_row)
+        label = getattr(self, "label_room_code", None)
+        entry = getattr(self, "entry_room_code", None)
         if mode == "create":
-            for w in row_widgets:
-                w.grid_remove()
+            if label is not None:
+                label.grid_remove()
+            if entry is not None:
+                entry.grid_remove()
             self.room_code_hint.config(text="The server generates the room code for you.")
             self.connect_button.config(text="Create room")
         else:
-            for w in row_widgets:
-                w.grid()
+            if label is not None:
+                label.grid(row=self.room_code_row, column=0, sticky="w", pady=4, padx=(0, 8))
+            if entry is not None:
+                entry.grid(row=self.room_code_row, column=1, pady=4)
             self.room_code_hint.config(text="Enter the 6-character code from the host.")
             self.connect_button.config(text="Join room")
 
     def _add_field(self, parent, label, key, default, row, show=None):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4, padx=(0, 8))
+        lbl = ttk.Label(parent, text=label)
+        lbl.grid(row=row, column=0, sticky="w", pady=4, padx=(0, 8))
         entry = ttk.Entry(parent, width=28, show=show) if show else ttk.Entry(parent, width=28)
         entry.insert(0, default)
         entry.grid(row=row, column=1, pady=4)
         setattr(self, f"entry_{key}", entry)
+        setattr(self, f"label_{key}", lbl)
+        entry.bind("<Return>", lambda _e: self._start_connect(self.connect_mode.get()))
+        if key == "room_code":
+            entry.bind("<KeyRelease>", lambda _e: self._normalize_room_code())
+            entry.bind("<<Paste>>", lambda _e: self.root.after(10, self._normalize_room_code))
+
+    def _normalize_room_code(self) -> None:
+        entry = getattr(self, "entry_room_code", None)
+        if entry is None:
+            return
+        value = entry.get().strip().upper()
+        if value != entry.get():
+            entry.delete(0, "end")
+            entry.insert(0, value)
 
     def _start_connect(self, mode: str) -> None:
         host = self.entry_host.get().strip()
         port_text = self.entry_port.get().strip()
         username = self.entry_username.get().strip()
-        room_code = self.entry_room_code.get().strip()
+        room_code = self.entry_room_code.get().strip().upper()
         password = self.entry_password.get()
 
         if not host:
@@ -353,12 +372,17 @@ class WhiteboardApp:
             ttk.Label(hc, text="Target").grid(row=0, column=0, sticky="w")
             self.host_target = ttk.Combobox(hc, values=[], width=12)
             self.host_target.grid(row=0, column=1, padx=4)
+            self.host_target.bind("<<ComboboxSelected>>", lambda _e: self._update_host_buttons())
             ttk.Label(hc, text="Role").grid(row=1, column=0, sticky="w")
-            self.host_role = ttk.Combobox(hc, values=["host", "editor", "viewer"], width=12)
+            self.host_role = ttk.Combobox(hc, values=["editor", "viewer"], width=12)
             self.host_role.set("editor")
             self.host_role.grid(row=1, column=1, padx=4)
-            ttk.Button(hc, text="Apply role", command=self._apply_role).grid(row=2, column=0, columnspan=2, pady=4, sticky="ew")
-            ttk.Button(hc, text="Kick", command=self._kick_user).grid(row=3, column=0, columnspan=2, pady=4, sticky="ew")
+            self.apply_role_btn = ttk.Button(hc, text="Apply role", command=self._apply_role)
+            self.apply_role_btn.grid(row=2, column=0, columnspan=2, pady=4, sticky="ew")
+            self.kick_btn = ttk.Button(hc, text="Kick", command=self._kick_user)
+            self.kick_btn.grid(row=3, column=0, columnspan=2, pady=4, sticky="ew")
+            self.apply_role_btn.state(["disabled"])
+            self.kick_btn.state(["disabled"])
             self.lock_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(hc, text="Lock room", variable=self.lock_var, command=self._toggle_lock).grid(row=4, column=0, columnspan=2, sticky="w")
 
@@ -465,7 +489,7 @@ class WhiteboardApp:
         style.map("TButton", background=[("active", t["accent_hover"])])
         style.configure("Tool.TButton", background=t["surface"], foreground=t["ink"], padding=4)
         style.map("Tool.TButton", background=[("active", t["surface_alt"])])
-        style.configure("ToolActive.TButton", background=t["highlight"], foreground=t["ink"], padding=4)
+        style.configure("ToolActive.TButton", background=t["accent"], foreground="#FFFFFF", padding=4)
         style.configure("TEntry", fieldbackground=t["surface"], foreground=t["ink"])
         style.configure("TCombobox", fieldbackground=t["surface"], foreground=t["ink"])
         style.configure("TScale", background=t["bg"])
@@ -784,7 +808,11 @@ class WhiteboardApp:
         for w in self.participants_frame.winfo_children():
             w.destroy()
         if hasattr(self, "host_target"):
-            self.host_target["values"] = [u.get("name", "") for u in self.state.participants]
+            names = [u.get("name", "") for u in self.state.participants if u.get("name") != self.username]
+            self.host_target["values"] = names
+            if self.host_target.get() not in names:
+                self.host_target.set("")
+            self._update_host_buttons()
         for u in self.state.participants:
             row = ttk.Frame(self.participants_frame)
             row.pack(fill="x", pady=2)
@@ -853,6 +881,16 @@ class WhiteboardApp:
         name = tk.simpledialog.askstring("Load board", "Board name:", parent=self.root)
         if name:
             self.net.send({"type": "load_board", "name": name})
+
+    def _update_host_buttons(self):
+        if not hasattr(self, "apply_role_btn"):
+            return
+        if self.host_target.get().strip():
+            self.apply_role_btn.state(["!disabled"])
+            self.kick_btn.state(["!disabled"])
+        else:
+            self.apply_role_btn.state(["disabled"])
+            self.kick_btn.state(["disabled"])
 
     def _apply_role(self):
         if not self.net or self.role != "host":
