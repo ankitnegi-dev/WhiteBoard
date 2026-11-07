@@ -3,14 +3,25 @@ AGENTS.md
 docs/ROADMAP.md
 .opencode/
 
-# Python and build junk
+# Python
 __pycache__/
 *.pyc
 .venv/
 venv/
-build/
+.pytest_cache/
+
+# PyInstaller output (anywhere in the repo)
 dist/
+**/dist/
 *.spec
+.pyi_work/
+spike/build/
+spike/dist/
+
+# Top-level build/ holds our scripts, so only ignore generated stuff in it
+build/*
+!build/*.bat
+!build/*.sh
 
 # Runtime data
 rooms/
