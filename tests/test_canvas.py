@@ -237,7 +237,7 @@ def test_malformed_op_rejected_over_wire():
         a = socket.create_connection(("127.0.0.1", port), timeout=3)
         a.settimeout(3)
         _send(a, {"type": "create_room", "username": "alice"})
-        code = _recv(a)["room_code"]
+        _recv(a)  # room_created
         _recv(a)  # participant_list
 
         # Malformed: bad color.
@@ -265,7 +265,7 @@ def test_resync_request_returns_ops():
         a = socket.create_connection(("127.0.0.1", port), timeout=3)
         a.settimeout(3)
         _send(a, {"type": "create_room", "username": "alice"})
-        code = _recv(a)["room_code"]
+        _recv(a)  # room_created
         _recv(a)  # participant_list
 
         sid = "stroke-r"

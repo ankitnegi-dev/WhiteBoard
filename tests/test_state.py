@@ -98,6 +98,29 @@ def test_active_drawers_timeout():
     assert "alice" not in state.active_drawers
 
 
+def test_delete_object_removes_from_mirror():
+    state = BoardState()
+    state.apply_op({"type": "stroke_start", "seq": 1, "stroke_id": "s1", "op_id": "o1",
+                    "tool": "pen", "color": "#000000", "width": 2, "x": 1, "y": 2, "user": "alice"})
+    assert "s1" in state.objects
+    state.apply_op({"type": "delete_object", "seq": 2, "op_id": "o2", "target_id": "s1", "user": "alice"})
+    assert "s1" not in state.objects
+
+
+def test_undo_redo_state_still_behaves():
+    state = BoardState()
+    state.apply_op({"type": "stroke_start", "seq": 1, "stroke_id": "s1", "op_id": "o1",
+                    "tool": "pen", "color": "#000000", "width": 2, "x": 1, "y": 2, "user": "alice"})
+    # Simulate an undo op removing the stroke.
+    state.apply_op({"type": "undo", "seq": 2, "op_id": "o2", "action": "remove_stroke",
+                    "target_id": "s1", "user": "alice"})
+    assert "s1" not in state.objects
+    # Redo restores it.
+    state.apply_op({"type": "redo", "seq": 3, "op_id": "o3", "action": "add_stroke",
+                    "object": {"id": "s1", "type": "stroke", "points": []}, "user": "alice"})
+    assert "s1" in state.objects
+
+
 def test_active_drawers_from_ops():
     state = BoardState()
     state.apply_op({"type": "stroke_start", "seq": 1, "stroke_id": "s1", "op_id": "o1",

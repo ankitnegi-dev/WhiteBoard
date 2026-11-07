@@ -8,6 +8,7 @@ main thread via root.after.
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -441,6 +442,7 @@ class WhiteboardApp:
 
     def _set_tool(self, tool):
         self.tool = tool
+        self._highlight_erase_target(None)
         for t, btn in self.tool_buttons.items():
             btn.configure(style="ToolActive.TButton" if t == tool else "Tool.TButton")
         self.status_conn.config(text=f"Tool: {tool}")
@@ -529,6 +531,20 @@ class WhiteboardApp:
     def _to_logical(self, x, y):
         return canvas_to_logical(x, y, self.canvas.winfo_width(), self.canvas.winfo_height(),
                                  self.offset_x, self.offset_y, self.scale)
+
+    def _highlight_erase_target(self, sid):
+        # Restore previous highlight.
+        prev = getattr(self, "_hover_erase", None)
+        if prev is not None and prev in self.canvas_items:
+            obj = self.state.objects.get(prev)
+            if obj is not None:
+                self.canvas.itemconfig(self.canvas_items[prev], width=obj.get("width", 2),
+                                       fill=obj.get("color", "#000000"))
+        self._hover_erase = sid
+        if sid is not None and sid in self.canvas_items:
+            item = self.canvas_items[sid]
+            self.canvas.itemconfig(item, width=max(2, (self.state.objects.get(sid, {}).get("width", 2) + 4)),
+                                   fill=self.theme["accent"])
 
     # ------------------------------------------------------------------ #
     # Drawing input
@@ -917,14 +933,30 @@ class WhiteboardApp:
     def _rebuild_participants(self) -> None:
         if not hasattr(self, "participants_frame"):
             return
-        for w in self.participants_frame.winfo_children():
-            w.destroy()
+        if not hasattr(self, "_participant_rows"):
+            self._participant_rows = {}
+            self._participant_signature = None
+
+        signature = tuple((u.get("name"), u.get("role"), u.get("online"), u.get("color")) for u in self.state.participants)
         if hasattr(self, "host_target"):
             names = [u.get("name", "") for u in self.state.participants if u.get("name") != self.username]
             self.host_target["values"] = names
             if self.host_target.get() not in names:
-                self.host_target.set("")
+                if names:
+                    self.host_target.set(names[0])
+                else:
+                    self.host_target.set("")
             self._update_host_buttons()
+
+        if signature == self._participant_signature:
+            self._update_activity_indicators()
+            return
+
+        # Rebuild rows only when membership or roles change.
+        for w in self.participants_frame.winfo_children():
+            w.destroy()
+        self._participant_rows.clear()
+
         for u in self.state.participants:
             row = ttk.Frame(self.participants_frame)
             row.pack(fill="x", pady=2)
@@ -935,20 +967,37 @@ class WhiteboardApp:
             online = u.get("online", True)
             if not online:
                 color = self.theme["ink_muted"]
-            dot.create_oval(2, 2, 10, 10, fill=color, outline="")
+            dot.create_oval(2, 2, 10, 10, fill=color, outline="", tags=("dot",))
             role = u.get("role", "editor")
             suffix = " (you)" if name == self.username else ""
             status = "" if online else " (offline)"
+            name_label = ttk.Label(row, text=f"{name}{suffix}  [{role}]{status}")
+            name_label.pack(side="left")
+            # Reserved slot for the drawing indicator (fixed width).
+            draw_label = ttk.Label(row, text="", width=10)
+            draw_label.pack(side="left")
+            self._participant_rows[name] = {
+                "dot": dot,
+                "name_label": name_label,
+                "draw_label": draw_label,
+                "color": color,
+                "online": online,
+            }
+
+        self._participant_signature = signature
+        self._update_activity_indicators()
+
+    def _update_activity_indicators(self):
+        if not hasattr(self, "_participant_rows"):
+            return
+        for name, info in self._participant_rows.items():
             active = name in self.state.active_drawers
-            glyph = " \u270e" if active else ""
-            if active and self._blink:
-                glyph = " \u270f"
-            lbl = ttk.Label(row, text=f"{name}{suffix}  [{role}]{status}{glyph}")
-            lbl.pack(side="left")
+            color = info.get("color", "#888888")
             if active:
-                lbl.config(foreground=color)
-            if not online:
-                lbl.config(foreground=self.theme["ink_muted"])
+                glyph = "\u270e" if not self._blink else "\u270f"
+                info["draw_label"].config(text=glyph, foreground=color)
+            else:
+                info["draw_label"].config(text="", foreground=self.theme["ink_muted"])
 
     def _append_chat(self, user, text, timestamp):
         self.chat_text.config(state="normal")
@@ -969,7 +1018,13 @@ class WhiteboardApp:
             self.chat_text.insert("end", f"  {ts}", "time_tag")
         self.chat_text.insert("end", "\n")
         self.chat_text.insert("end", f"{text}\n", "body_tag")
-        self.chat_text.see("end")
+        # Auto-scroll only if the user was already at the bottom.
+        try:
+            at_bottom = self.chat_text.yview()[1] >= 0.999
+        except tk.TclError:
+            at_bottom = True
+        if at_bottom:
+            self.chat_text.see("end")
         self.chat_text.config(state="disabled")
 
     def _send_chat(self):
