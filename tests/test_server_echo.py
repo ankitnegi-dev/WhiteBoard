@@ -125,6 +125,30 @@ def test_server_survives_garbage_bytes(server):
         s.close()
 
 
+def test_ping_pong_echoes_timestamp(server):
+    port, _proc = server
+    s = socket.create_connection(("127.0.0.1", port), timeout=3)
+    s.settimeout(3)
+    try:
+        _send_msg(s, {"type": "create_room", "username": "alice"})
+        _recv_msg(s)  # room_created
+        # drain participant_list
+        try:
+            s.settimeout(0.2)
+            while True:
+                _recv_msg(s)
+        except socket.timeout:
+            pass
+        s.settimeout(3)
+        ts = 1234567890.5
+        _send_msg(s, {"type": "ping", "ts": ts})
+        reply = _recv_msg(s)
+        assert reply["type"] == "pong"
+        assert reply["ts"] == ts
+    finally:
+        s.close()
+
+
 def test_idle_client_still_echoes(server):
     port, _proc = server
     fake_client = os.path.join(ROOT, "tests", "fake_client.py")

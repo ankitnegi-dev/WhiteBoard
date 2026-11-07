@@ -35,7 +35,7 @@ Example:
 - join_room {username, room_code, password?} -> join_ok {token, role, user_color, participants, snapshot, seq, chat_history} or join_denied {reason, message}. Reasons: room_not_found, room_locked, username_taken, wrong_password, bad_request
 - reconnect {token, room_code, last_seq} -> reconnect_ok {ops_since or snapshot} or reconnect_denied
 - leave
-- ping / pong (heartbeat)
+- ping / pong (heartbeat; pong echoes the ping's ts for RTT)
 - error {code, message}
 
 ### Participants

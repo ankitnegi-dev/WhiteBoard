@@ -63,3 +63,54 @@ def test_snapshot_applies():
     assert state.applied_seq == 5
     assert "s1" in state.objects
     assert len(state.chat) == 1
+
+
+def test_active_drawers_lifecycle():
+    state = BoardState()
+    state.start_drawing("alice")
+    assert "alice" in state.active_drawers
+
+    state.note_drawing("bob")
+    assert "bob" in state.active_drawers
+
+    state.end_drawing("alice")
+    assert "alice" not in state.active_drawers
+    assert "bob" in state.active_drawers
+
+    state.remove_drawer("bob")
+    assert "bob" not in state.active_drawers
+
+    state.start_drawing("carol")
+    state.start_drawing("dave")
+    assert len(state.active_drawers) == 2
+
+    state.clear_drawers()
+    assert len(state.active_drawers) == 0
+
+
+def test_active_drawers_timeout():
+    state = BoardState()
+    now = 1000.0
+    state.start_drawing("alice", now=now)
+    state.prune_drawers(timeout=3.0, now=now + 1.0)
+    assert "alice" in state.active_drawers
+    state.prune_drawers(timeout=3.0, now=now + 4.0)
+    assert "alice" not in state.active_drawers
+
+
+def test_active_drawers_from_ops():
+    state = BoardState()
+    state.apply_op({"type": "stroke_start", "seq": 1, "stroke_id": "s1", "op_id": "o1",
+                    "tool": "pen", "color": "#000000", "width": 2, "x": 1, "y": 2, "user": "alice"})
+    assert "alice" in state.active_drawers
+
+    state.apply_op({"type": "stroke_points", "seq": 2, "stroke_id": "s1", "op_id": "o2",
+                    "points": [[1, 2], [3, 4]], "user": "alice"})
+    assert "alice" in state.active_drawers
+
+    state.apply_op({"type": "stroke_end", "seq": 3, "stroke_id": "s1", "op_id": "o3", "user": "alice"})
+    assert "alice" not in state.active_drawers
+
+    state.apply_op({"type": "clear_canvas", "seq": 4, "op_id": "o4", "user": "alice"})
+    # clear does not add; active already empty
+    assert "alice" not in state.active_drawers

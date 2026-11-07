@@ -7,6 +7,7 @@ a gap that requires a resync.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Optional
 
 
@@ -60,6 +61,9 @@ class BoardState:
         self.pending_op_ids: set[str] = set()
         # Buffered ops that arrived ahead of their seq.
         self._buffered: dict[int, dict[str, Any]] = {}
+        # Activity tracking.
+        self.active_drawers: set[str] = set()
+        self._drawer_last: dict[str, float] = {}
 
     def apply_snapshot(self, snapshot: dict[str, Any]) -> None:
         objs = snapshot.get("objects", [])
@@ -74,6 +78,46 @@ class BoardState:
 
     def update_participants(self, users: list[dict[str, Any]]) -> None:
         self.participants = [dict(u) for u in users]
+
+    # ------------------------------------------------------------------ #
+    # Activity tracking
+    # ------------------------------------------------------------------ #
+    def start_drawing(self, user: str, now: Optional[float] = None) -> None:
+        if not isinstance(user, str) or not user:
+            return
+        if now is None:
+            now = time.time()
+        self.active_drawers.add(user)
+        self._drawer_last[user] = now
+
+    def note_drawing(self, user: str, now: Optional[float] = None) -> None:
+        if not isinstance(user, str) or not user:
+            return
+        if user not in self.active_drawers:
+            self.active_drawers.add(user)
+        if now is None:
+            now = time.time()
+        self._drawer_last[user] = now
+
+    def end_drawing(self, user: str) -> None:
+        self.active_drawers.discard(user)
+        self._drawer_last.pop(user, None)
+
+    def remove_drawer(self, user: str) -> None:
+        self.active_drawers.discard(user)
+        self._drawer_last.pop(user, None)
+
+    def clear_drawers(self) -> None:
+        self.active_drawers.clear()
+        self._drawer_last.clear()
+
+    def prune_drawers(self, timeout: float = 3.0, now: Optional[float] = None) -> None:
+        if now is None:
+            now = time.time()
+        stale = [u for u, t in self._drawer_last.items() if now - t > timeout]
+        for u in stale:
+            self.active_drawers.discard(u)
+            self._drawer_last.pop(u, None)
 
     # ------------------------------------------------------------------ #
     # Op application with gap detection
@@ -108,6 +152,7 @@ class BoardState:
 
     def _apply_one(self, op: dict[str, Any]) -> None:
         mtype = op.get("type")
+        user = op.get("user")
         if mtype == "stroke_start":
             sid = op.get("stroke_id")
             if isinstance(sid, str):
@@ -118,9 +163,10 @@ class BoardState:
                     "color": op.get("color", "#000000"),
                     "width": op.get("width", 2),
                     "points": [],
-                    "user": op.get("user"),
+                    "user": user,
                     "seq": op.get("seq", 0),
                 }
+            self.start_drawing(user if isinstance(user, str) else "")
         elif mtype == "stroke_points":
             sid = op.get("stroke_id")
             obj = self.objects.get(sid) if isinstance(sid, str) else None
@@ -130,17 +176,48 @@ class BoardState:
                     for pt in pts:
                         if isinstance(pt, (list, tuple)) and len(pt) == 2:
                             obj["points"].append([pt[0], pt[1]])
+            self.note_drawing(user if isinstance(user, str) else "")
         elif mtype == "stroke_end":
             sid = op.get("stroke_id")
             obj = self.objects.get(sid) if isinstance(sid, str) else None
             if obj is not None:
                 obj["ended"] = True
+            self.end_drawing(user if isinstance(user, str) else "")
         elif mtype == "delete_object":
             tid = op.get("target_id")
             if isinstance(tid, str):
                 self.objects.pop(tid, None)
         elif mtype == "clear_canvas":
             self.objects.clear()
+            self.clear_drawers()
+        elif mtype == "undo":
+            action = op.get("action")
+            if action == "remove_stroke":
+                tid = op.get("target_id")
+                if isinstance(tid, str):
+                    self.objects.pop(tid, None)
+            elif action == "restore_object":
+                obj = op.get("object")
+                if isinstance(obj, dict) and "id" in obj:
+                    self.objects[obj["id"]] = dict(obj)
+            elif action == "restore_objects":
+                for obj in op.get("objects", []):
+                    if isinstance(obj, dict) and "id" in obj:
+                        self.objects[obj["id"]] = dict(obj)
+        elif mtype == "redo":
+            action = op.get("action")
+            if action == "add_stroke":
+                obj = op.get("object")
+                if isinstance(obj, dict) and "id" in obj:
+                    self.objects[obj["id"]] = dict(obj)
+            elif action == "remove_stroke":
+                tid = op.get("target_id")
+                if isinstance(tid, str):
+                    self.objects.pop(tid, None)
+            elif action == "remove_objects":
+                for tid in op.get("target_ids", []):
+                    if isinstance(tid, str):
+                        self.objects.pop(tid, None)
         elif mtype == "undo":
             action = op.get("action")
             if action == "remove_stroke":

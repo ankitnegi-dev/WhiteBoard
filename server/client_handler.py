@@ -187,7 +187,7 @@ def handle_client(
                 break
             elif mtype in ("pong", "ping"):
                 if mtype == "ping":
-                    enqueue({"type": "pong"})
+                    enqueue({"type": "pong", "ts": msg.get("ts")})
                 continue
             elif mtype == "resync_request":
                 last_seq = msg.get("last_seq")

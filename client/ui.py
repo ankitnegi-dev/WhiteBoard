@@ -78,11 +78,15 @@ class WhiteboardApp:
         # Drawing state.
         self.tool = "pen"
         self.color = "#1F2937"
+        self.user_color = "#1E5B6B"
         self.width = 2.0
         self.canvas_items: dict[str, int] = {}   # stroke_id -> canvas item id
         self.cursor_items: dict[str, int] = {}   # username -> marker item
         self.local_strokes: dict[str, dict[str, Any]] = {}
         self._last_cursor_send = 0.0
+        self._blink = False
+        self._last_ping_time = 0.0
+        self._ping_ts = 0.0
 
         # Scaling state for the logical 1600x900 canvas.
         self.scale = 1.0
@@ -243,18 +247,27 @@ class WhiteboardApp:
         if mtype == "room_created":
             self.room_code = resp["room_code"]
             self.role = resp.get("role", "host")
+            # Host color: look it up once participants arrive; default accent.
+            self.user_color = "#1E5B6B"
         elif mtype == "join_ok":
             self.room_code = resp.get("room_code", self.entry_room_code.get().strip().upper())
             # room code may not be in join_ok; keep from entry
             if not self.room_code:
                 self.room_code = self.entry_room_code.get().strip().upper()
             self.role = resp.get("role", "editor")
+            self.user_color = resp.get("user_color", self.user_color)
+            if not self.user_color and isinstance(resp.get("participants"), list):
+                for u in resp["participants"]:
+                    if u.get("name") == self.username:
+                        self.user_color = u.get("color", self.user_color)
             self.state.apply_snapshot(resp.get("snapshot", {}))
             if isinstance(resp.get("chat_history"), list):
                 self.state.apply_chat_history(resp["chat_history"])
             if isinstance(resp.get("participants"), list):
                 self.state.update_participants(resp["participants"])
             # Track pending none.
+
+        self.root.title(f"LAN Whiteboard - {self.username} ({self.role}) - Room {self.room_code}")
 
         # Remove connect screen.
         self.connect_frame.destroy()
@@ -316,11 +329,6 @@ class WhiteboardApp:
             self.save_btn.state(["disabled"])
             self.load_btn.state(["disabled"])
 
-        ttk.Label(self.toolbar, text="Width").pack(pady=(8, 0))
-        self.width_scale = ttk.Scale(self.toolbar, from_=1, to=20, orient="vertical", command=self._on_width)
-        self.width_scale.set(self.width)
-        self.width_scale.pack(fill="y", expand=True, pady=4)
-
         ttk.Separator(self.toolbar, orient="horizontal").pack(fill="x", pady=8)
         self.theme_btn = ttk.Button(self.toolbar, text="Theme", command=self._toggle_theme)
         self.theme_btn.pack(fill="x", pady=4)
@@ -340,6 +348,17 @@ class WhiteboardApp:
         self.right = ttk.Frame(self.main_frame, width=280, padding=8)
         self.right.pack(side="right", fill="y")
         self.right.pack_propagate(False)
+
+        # Identity chip.
+        self.identity_frame = ttk.Frame(self.right, padding=6, relief="solid", borderwidth=1)
+        self.identity_frame.pack(fill="x", pady=(0, 8))
+        self.identity_dot = tk.Canvas(self.identity_frame, width=14, height=14, highlightthickness=0, bg=self.theme["bg"])
+        self.identity_dot.pack(side="left", padx=(0, 6))
+        self.identity_dot.create_oval(2, 2, 12, 12, fill=self.user_color, outline="", tags=("dot",))
+        self.identity_name = ttk.Label(self.identity_frame, text=self.username, font=("Segoe UI", 11, "bold"))
+        self.identity_name.pack(side="left")
+        self.identity_role = ttk.Label(self.identity_frame, text=self.role, font=("Segoe UI", 9))
+        self.identity_role.pack(side="left", padx=6)
 
         room_header = ttk.Frame(self.right)
         room_header.pack(fill="x", pady=(0, 8))
@@ -391,8 +410,8 @@ class WhiteboardApp:
         self.status_bar.pack(side="bottom", fill="x")
         self.status_conn = ttk.Label(self.status_bar, text="Connecting")
         self.status_conn.pack(side="left", padx=4)
-        self.status_room = ttk.Label(self.status_bar, text="")
-        self.status_room.pack(side="left", padx=12)
+        self.status_activity = ttk.Label(self.status_bar, text="")
+        self.status_activity.pack(side="left", padx=12)
         self.status_latency = ttk.Label(self.status_bar, text="latency: -")
         self.status_latency.pack(side="right", padx=4)
         self.status_seq = ttk.Label(self.status_bar, text="seq: 0")
@@ -516,6 +535,7 @@ class WhiteboardApp:
     # ------------------------------------------------------------------ #
     def _on_press(self, event):
         lx, ly = self._to_logical(event.x, event.y)
+        self._last_erased = None
         if self.tool == "pen":
             sid = str(uuid.uuid4())
             op_id = str(uuid.uuid4())
@@ -529,14 +549,18 @@ class WhiteboardApp:
                 "batch": [],
             }
             self.state.track_pending(op_id)
+            self.state.start_drawing(self.username)
             if self.net:
                 self.net.send({"type": "stroke_start", "op_id": op_id, "stroke_id": sid,
                                "tool": "pen", "color": self.color, "width": self.width,
                                "x": lx, "y": ly})
         elif self.tool == "eraser":
-            sid = find_stroke_at(self.state.objects, lx, ly)
-            if sid and self.net:
+            sid = find_stroke_at(self.state.objects, lx, ly, threshold=10.0 / max(self.scale, 0.001))
+            if sid and self.net and self.role != "viewer":
                 self.net.send({"type": "delete_object", "op_id": str(uuid.uuid4()), "target_id": sid})
+                logging.getLogger("whiteboard.ui").debug("sent delete_object target=%s", sid)
+            elif sid and self.role == "viewer":
+                self._toast("Viewers cannot erase strokes.")
 
     def _on_motion(self, event):
         lx, ly = self._to_logical(event.x, event.y)
@@ -559,8 +583,17 @@ class WhiteboardApp:
                 if self.net:
                     self.net.send({"type": "stroke_points", "op_id": str(uuid.uuid4()),
                                    "stroke_id": sid, "points": info["batch"]})
+                self.state.note_drawing(self.username, now)
                 info["batch"] = []
                 info["last_send"] = now
+        elif self.tool == "eraser":
+            # Hover highlight and sweep-to-erase.
+            sid = find_stroke_at(self.state.objects, lx, ly, threshold=10.0 / max(self.scale, 0.001))
+            self._highlight_erase_target(sid)
+            if sid and self.net and self.role != "viewer" and sid != getattr(self, "_last_erased", None):
+                self.net.send({"type": "delete_object", "op_id": str(uuid.uuid4()), "target_id": sid})
+                logging.getLogger("whiteboard.ui").debug("sent delete_object target=%s", sid)
+                self._last_erased = sid
         else:
             # Throttled cursor move.
             now = time.time()
@@ -579,6 +612,7 @@ class WhiteboardApp:
                            "stroke_id": sid, "points": info["batch"]})
         if self.net:
             self.net.send({"type": "stroke_end", "op_id": str(uuid.uuid4()), "stroke_id": sid})
+        self.state.end_drawing(self.username)
 
     def _on_hover(self, event):
         # Keep cursor updates light; handled in motion.
@@ -591,13 +625,45 @@ class WhiteboardApp:
         if self.net is None:
             return
         try:
-            while True:
-                msg = self.net.inbox.get_nowait()
-                self._handle_message(msg)
-        except queue.Empty:
-            pass
-        self.status_seq.config(text=f"seq: {self.state.applied_seq}")
-        self.root.after(10, self._poll)
+            try:
+                while True:
+                    msg = self.net.inbox.get_nowait()
+                    self._handle_message(msg)
+            except queue.Empty:
+                pass
+
+            # Prune stale drawers and blink.
+            before = set(self.state.active_drawers)
+            self.state.prune_drawers()
+            changed = before != set(self.state.active_drawers)
+            self._blink = not self._blink if self.state.active_drawers else False
+            if changed or self.state.active_drawers:
+                self._rebuild_participants()
+
+            # Latency ping every 5 seconds.
+            now = time.time()
+            if now - self._last_ping_time >= 5.0:
+                self._last_ping_time = now
+                self._ping_ts = now
+                if self.net:
+                    self.net.send({"type": "ping", "ts": now})
+
+            # Status bar activity text.
+            self._update_status()
+        except Exception as exc:
+            import logging
+            logging.getLogger("whiteboard.ui").exception("poll loop error: %s", exc)
+            if not getattr(self, "_poll_error_shown", False):
+                self._poll_error_shown = True
+                try:
+                    self._toast(f"UI error: {exc}")
+                except Exception:
+                    pass
+        finally:
+            try:
+                self.root.after(10, self._poll)
+            except Exception:
+                pass
 
     def _handle_message(self, msg: dict[str, Any]) -> None:
         mtype = msg.get("type")
@@ -608,10 +674,41 @@ class WhiteboardApp:
             users = msg.get("users", [])
             if isinstance(users, list):
                 self.state.update_participants(users)
+                for u in users:
+                    if u.get("name") == self.username and u.get("color"):
+                        self.user_color = u.get("color")
+                        if hasattr(self, "identity_dot"):
+                            self.identity_dot.delete("dot")
+                            self.identity_dot.create_oval(2, 2, 12, 12, fill=self.user_color, outline="", tags=("dot",))
+                # Update own role if changed.
+                for u in users:
+                    if u.get("name") == self.username and u.get("role") != self.role:
+                        self.role = u.get("role", self.role)
+                        self.root.title(f"LAN Whiteboard - {self.username} ({self.role}) - Room {self.room_code}")
+                        if hasattr(self, "identity_role"):
+                            self.identity_role.config(text=self.role)
+                        if self.role != "host":
+                            if hasattr(self, "clear_btn"):
+                                self.clear_btn.state(["disabled"])
+                            if hasattr(self, "save_btn"):
+                                self.save_btn.state(["disabled"])
+                            if hasattr(self, "load_btn"):
+                                self.load_btn.state(["disabled"])
+                        else:
+                            if hasattr(self, "clear_btn"):
+                                self.clear_btn.state(["!disabled"])
+                            if hasattr(self, "save_btn"):
+                                self.save_btn.state(["!disabled"])
+                            if hasattr(self, "load_btn"):
+                                self.load_btn.state(["!disabled"])
                 self._rebuild_participants()
             return
-        if mtype in ("user_joined", "user_left", "user_disconnected", "user_reconnected"):
-            # participant_list usually follows; nothing else needed.
+        if mtype in ("user_joined", "user_left", "user_reconnected"):
+            return
+        if mtype == "user_disconnected":
+            user = msg.get("username")
+            if isinstance(user, str):
+                self.state.remove_drawer(user)
             return
         if mtype == "chat":
             self.state.chat.append(msg)
@@ -713,8 +810,10 @@ class WhiteboardApp:
             self.canvas.delete("all")
             self.canvas_items.clear()
             self.state.objects.clear()
+            self.state.clear_drawers()
             return
         if mtype == "kicked":
+            self.state.remove_drawer(self.username)
             self._toast("You were kicked from the room.")
             if self.net:
                 self.net.disconnect()
@@ -725,6 +824,13 @@ class WhiteboardApp:
         if mtype == "boards_list":
             boards = msg.get("boards", [])
             self._toast("Boards: " + ", ".join(boards) if boards else "No saved boards.")
+            return
+        if mtype == "pong":
+            ts = msg.get("ts")
+            if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                rtt = (time.time() - float(ts)) * 1000.0
+                if hasattr(self, "status_latency"):
+                    self.status_latency.config(text=f"latency: {int(rtt)} ms")
             return
         if mtype == "error":
             self._toast(f"Rejected: {msg.get('message', msg.get('code'))}")
@@ -799,12 +905,18 @@ class WhiteboardApp:
             self.canvas_items[sid] = item
         # Redraw cursors on top.
         for user, item in list(self.cursor_items.items()):
-            self.canvas.tag_raise(item)
+            if isinstance(item, tuple):
+                for it in item:
+                    self.canvas.tag_raise(it)
+            else:
+                self.canvas.tag_raise(item)
 
     # ------------------------------------------------------------------ #
     # Participants and chat
     # ------------------------------------------------------------------ #
     def _rebuild_participants(self) -> None:
+        if not hasattr(self, "participants_frame"):
+            return
         for w in self.participants_frame.winfo_children():
             w.destroy()
         if hasattr(self, "host_target"):
@@ -818,14 +930,25 @@ class WhiteboardApp:
             row.pack(fill="x", pady=2)
             dot = tk.Canvas(row, width=12, height=12, highlightthickness=0, bg=self.theme["bg"])
             dot.pack(side="left", padx=(0, 6))
-            color = u.get("color", "#888888")
-            dot.create_oval(2, 2, 10, 10, fill=color, outline="")
             name = u.get("name", "?")
-            role = u.get("role", "editor")
+            color = u.get("color", "#888888")
             online = u.get("online", True)
+            if not online:
+                color = self.theme["ink_muted"]
+            dot.create_oval(2, 2, 10, 10, fill=color, outline="")
+            role = u.get("role", "editor")
+            suffix = " (you)" if name == self.username else ""
             status = "" if online else " (offline)"
-            lbl = ttk.Label(row, text=f"{name}  [{role}]{status}")
+            active = name in self.state.active_drawers
+            glyph = " \u270e" if active else ""
+            if active and self._blink:
+                glyph = " \u270f"
+            lbl = ttk.Label(row, text=f"{name}{suffix}  [{role}]{status}{glyph}")
             lbl.pack(side="left")
+            if active:
+                lbl.config(foreground=color)
+            if not online:
+                lbl.config(foreground=self.theme["ink_muted"])
 
     def _append_chat(self, user, text, timestamp):
         self.chat_text.config(state="normal")
@@ -932,12 +1055,23 @@ class WhiteboardApp:
         for u in self.state.participants:
             if u.get("name") == user:
                 color = u.get("color", color)
+        active = user in self.state.active_drawers
         item = self.cursor_items.get(user)
         if item is None:
-            item = self.canvas.create_text(cx, cy, text=user, fill=color, font=("Segoe UI", 9, "bold"), tags=("cursor",))
-            self.cursor_items[user] = item
+            if active:
+                oval = self.canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, fill=color, outline=color, tags=("cursor",))
+            else:
+                oval = self.canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, fill="", outline=color, tags=("cursor",))
+            text = self.canvas.create_text(cx + 8, cy, text=user, fill=color, font=("Segoe UI", 9, "bold"), anchor="w", tags=("cursor",))
+            self.cursor_items[user] = (oval, text)
         else:
-            self.canvas.coords(item, cx, cy)
+            oval, text = item
+            if active:
+                self.canvas.itemconfig(oval, fill=color, outline=color)
+            else:
+                self.canvas.itemconfig(oval, fill="", outline=color)
+            self.canvas.coords(oval, cx - 4, cy - 4, cx + 4, cy + 4)
+            self.canvas.coords(text, cx + 8, cy)
 
     # ------------------------------------------------------------------ #
     # Status
@@ -945,8 +1079,20 @@ class WhiteboardApp:
     def _update_status(self):
         if self.net is None:
             return
-        self.status_conn.config(text="Connected" if self.net.connected else "Disconnected")
-        self.status_room.config(text=f"room: {self.room_code}")
+        self.status_conn.config(text=f"Connected | room {self.room_code}")
+        # Activity text.
+        drawers = sorted(self.state.active_drawers)
+        if len(drawers) == 1:
+            activity = f"{drawers[0]} is drawing"
+        elif len(drawers) == 2:
+            activity = f"{drawers[0]} and {drawers[1]} are drawing"
+        elif len(drawers) > 2:
+            activity = f"{len(drawers)} people are drawing"
+        else:
+            activity = ""
+        if hasattr(self, "status_activity"):
+            self.status_activity.config(text=activity)
+        self.status_seq.config(text=f"seq: {self.state.applied_seq}")
 
 
 class Tooltip:
