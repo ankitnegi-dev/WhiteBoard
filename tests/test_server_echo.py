@@ -82,22 +82,20 @@ def _send_msg(sock: socket.socket, obj: dict) -> None:
     sock.sendall(struct.pack(">I", len(raw)) + raw)
 
 
-def test_echo_with_three_simultaneous_clients(server):
+def test_three_clients_create_rooms_simultaneously(server):
     port, _proc = server
     socks = []
     try:
-        for _ in range(3):
+        for i in range(3):
             s = socket.create_connection(("127.0.0.1", port), timeout=3)
             s.settimeout(3)
             socks.append(s)
-
-        for i, s in enumerate(socks):
-            _send_msg(s, {"type": "chat", "text": f"hello-{i}"})
+            _send_msg(s, {"type": "create_room", "username": f"user-{i}"})
 
         for i, s in enumerate(socks):
             reply = _recv_msg(s)
-            assert reply["echo"] is True
-            assert reply["text"] == f"hello-{i}"
+            assert reply["type"] == "room_created"
+            assert reply["role"] == "host"
     finally:
         for s in socks:
             try:
@@ -116,14 +114,13 @@ def test_server_survives_garbage_bytes(server):
         garbage.close()
     time.sleep(0.3)
 
-    # A fresh client must still get an echo.
+    # A fresh client must still be served.
     s = socket.create_connection(("127.0.0.1", port), timeout=3)
     s.settimeout(3)
     try:
-        _send_msg(s, {"type": "ping", "n": 7})
+        _send_msg(s, {"type": "create_room", "username": "survivor"})
         reply = _recv_msg(s)
-        assert reply["echo"] is True
-        assert reply["n"] == 7
+        assert reply["type"] == "room_created"
     finally:
         s.close()
 
@@ -141,6 +138,9 @@ def test_idle_client_still_echoes(server):
             str(port),
             "--connect-timeout",
             "0.2",
+            "--create",
+            "--username",
+            "tester",
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -160,19 +160,17 @@ def test_idle_client_still_echoes(server):
         # Stay idle longer than the connect timeout. With the bug, the
         # receiver thread would die here with a socket.timeout.
         time.sleep(0.6)
-        assert proc.poll() is None, "client exited during idle"
-        proc.stdin.write("hello-idle\n")
-        proc.stdin.flush()
 
         deadline = time.time() + 5.0
         while time.time() < deadline:
-            if any("hello-idle" in line for line in collected):
+            if any("room_created" in line for line in collected):
                 break
             time.sleep(0.1)
 
         output = "".join(collected)
-        assert "hello-idle" in output, f"echo not received; output={output!r}"
+        assert "room_created" in output, f"room not created; output={output!r}"
         assert "<- error" not in output, f"receiver died; output={output!r}"
+        assert proc.poll() is None, "client exited during idle"
     finally:
         try:
             proc.stdin.close()

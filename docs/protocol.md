@@ -32,7 +32,7 @@ Example:
 ### Connection and session
 
 - create_room {username, password?} -> room_created {room_code, token, role: host}
-- join_room {username, room_code, password?} -> join_ok {token, role, user_color, participants, snapshot, seq, chat_history} or join_denied {reason}
+- join_room {username, room_code, password?} -> join_ok {token, role, user_color, participants, snapshot, seq, chat_history} or join_denied {reason, message}. Reasons: room_not_found, room_locked, username_taken, wrong_password, bad_request
 - reconnect {token, room_code, last_seq} -> reconnect_ok {ops_since or snapshot} or reconnect_denied
 - leave
 - ping / pong (heartbeat)
@@ -127,8 +127,9 @@ Example:
 
 - Message must parse, have a known type, and required fields with the right
   types.
-- Coordinates inside the logical canvas; width, color, text length within
-  limits; point batch size limited.
+- Coordinates inside the logical canvas (0..1600 by 0..900); width between
+  1 and 50; color as #rrggbb; text length <= 500; point batch <= 500;
+  chat text <= 500.
 - Sender must be a member with a role that allows the op (viewers cannot
   draw; only host can clear or change roles).
 - Rate limit per client (for example max ops per second) to prevent

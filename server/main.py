@@ -36,6 +36,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="logging verbosity",
     )
+    parser.add_argument("--heartbeat-interval", type=float, default=5.0, help="seconds between server pings")
+    parser.add_argument("--heartbeat-timeout", type=float, default=15.0, help="seconds of silence before disconnect")
     return parser.parse_args(argv)
 
 
@@ -101,7 +103,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             log.info("client connected from %s:%d", addr[0], addr[1])
             thread = threading.Thread(
                 target=handle_client,
-                args=(conn, addr, log),
+                args=(conn, addr, log, args.heartbeat_interval, args.heartbeat_timeout),
                 name=f"client-{addr[0]}:{addr[1]}",
                 daemon=True,
             )
