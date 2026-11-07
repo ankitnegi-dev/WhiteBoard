@@ -211,6 +211,7 @@ def test_chat_history_order_and_timestamps():
         assert _recv(b)["type"] == "join_ok"
 
         _send(a, {"type": "chat", "text": "first"})
+        time.sleep(0.2)
         _send(b, {"type": "chat", "text": "second"})
         time.sleep(0.3)
 

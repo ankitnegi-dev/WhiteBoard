@@ -77,6 +77,26 @@ Linux:
 Type a line and press Enter to send it; received messages print on a
 separate thread.
 
+## Run the GUI client
+
+Windows cmd:
+
+```
+.venv\Scripts\python.exe -m client.main
+```
+
+Linux:
+
+```
+.venv/bin/python -m client.main
+```
+
+If tkinter is missing on Linux, install it first:
+
+```
+sudo apt install python3-tk
+```
+
 ## Run the tests
 
 Windows cmd:
