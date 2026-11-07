@@ -139,6 +139,36 @@ class BoardState:
             tid = op.get("target_id")
             if isinstance(tid, str):
                 self.objects.pop(tid, None)
+        elif mtype == "clear_canvas":
+            self.objects.clear()
+        elif mtype == "undo":
+            action = op.get("action")
+            if action == "remove_stroke":
+                tid = op.get("target_id")
+                if isinstance(tid, str):
+                    self.objects.pop(tid, None)
+            elif action == "restore_object":
+                obj = op.get("object")
+                if isinstance(obj, dict) and "id" in obj:
+                    self.objects[obj["id"]] = dict(obj)
+            elif action == "restore_objects":
+                for obj in op.get("objects", []):
+                    if isinstance(obj, dict) and "id" in obj:
+                        self.objects[obj["id"]] = dict(obj)
+        elif mtype == "redo":
+            action = op.get("action")
+            if action == "add_stroke":
+                obj = op.get("object")
+                if isinstance(obj, dict) and "id" in obj:
+                    self.objects[obj["id"]] = dict(obj)
+            elif action == "remove_stroke":
+                tid = op.get("target_id")
+                if isinstance(tid, str):
+                    self.objects.pop(tid, None)
+            elif action == "remove_objects":
+                for tid in op.get("target_ids", []):
+                    if isinstance(tid, str):
+                        self.objects.pop(tid, None)
 
     def apply_ops_since(self, from_seq: int, ops: list[dict[str, Any]]) -> None:
         for op in sorted(ops, key=lambda o: o.get("seq", 0)):

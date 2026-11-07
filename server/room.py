@@ -42,7 +42,10 @@ class Participant:
     role: str = "editor"          # host | editor | viewer
     online: bool = True
     token: str = ""
+    kicked: bool = False
+    state: Optional[dict[str, Any]] = None
     send: Optional[Callable[[dict[str, Any]], None]] = None
+    kick: Optional[Callable[[], None]] = None
 
 
 class Room:
@@ -63,8 +66,9 @@ class Room:
         self.chat_seq: int = 0
 
         # Undo/redo stacks are kept per user (filled in Day 4).
-        self.undo_stacks: Dict[str, List[int]] = {}
-        self.redo_stacks: Dict[str, List[int]] = {}
+        self.undo_stacks: Dict[str, list[dict[str, Any]]] = {}
+        self.redo_stacks: Dict[str, list[dict[str, Any]]] = {}
+        self.dirty: bool = False
 
     def has_password(self) -> bool:
         return self.password_hash is not None
@@ -206,6 +210,7 @@ class Room:
                     "points": [],
                     "user": username,
                 }
+                self.redo_stacks.pop(username, None)
             elif mtype == "stroke_points":
                 sid = msg["stroke_id"]
                 obj = self.objects.get(sid)
@@ -219,8 +224,18 @@ class Room:
                 if obj is None or obj.get("type") != "stroke":
                     return "invalid", None, "stroke_not_found"
                 obj["ended"] = True
+                self.undo_stacks.setdefault(username, []).append(
+                    {"kind": "stroke", "user": username, "stroke_id": sid, "object": dict(obj)}
+                )
             elif mtype == "delete_object":
-                self.objects.pop(msg["target_id"], None)
+                tid = msg["target_id"]
+                existing = self.objects.get(tid)
+                if existing is not None:
+                    self.undo_stacks.setdefault(username, []).append(
+                        {"kind": "delete", "user": username, "target_id": tid, "object": dict(existing)}
+                    )
+                self.objects.pop(tid, None)
+                self.redo_stacks.pop(username, None)
 
             # Stamp and append.
             self.seq += 1
@@ -249,6 +264,129 @@ class Room:
             entry = {"user": username, "text": text, "timestamp": ts, "seq_chat": self.chat_seq}
             self.chat.append(entry)
             return True, entry, ""
+
+    # ------------------------------------------------------------------ #
+    # Undo / redo / clear
+    # ------------------------------------------------------------------ #
+    def clear_redo(self, username: str) -> None:
+        with self.lock:
+            self.redo_stacks.pop(username, None)
+
+    def push_undo(self, username: str, entry: dict[str, Any]) -> None:
+        with self.lock:
+            self.undo_stacks.setdefault(username, []).append(entry)
+
+    def clear_canvas(self, op_id: Any, username: str) -> Tuple[str, Optional[dict[str, Any]], str]:
+        with self.lock:
+            if not isinstance(op_id, str) or not op_id.strip():
+                return "invalid", None, "bad_op_id"
+            if op_id in self.seen_op_ids:
+                return "duplicate", None, "duplicate_op_id"
+            cleared = [dict(o) for o in self.objects.values()]
+            self.objects.clear()
+            entry = {"kind": "clear", "user": username, "cleared": cleared}
+            self.seq += 1
+            op = {"type": "clear_canvas", "op_id": op_id, "user": username,
+                  "seq": self.seq, "ts": time.time()}
+            self.seen_op_ids.add(op_id)
+            self.op_log.append(op)
+            self.dirty = True
+            self.undo_stacks.setdefault(username, []).append(entry)
+            self.redo_stacks.pop(username, None)
+            return "ok", op, ""
+
+    def undo(self, op_id: Any, username: str) -> Tuple[str, Optional[dict[str, Any]], str]:
+        with self.lock:
+            if not isinstance(op_id, str) or not op_id.strip():
+                return "invalid", None, "bad_op_id"
+            if op_id in self.seen_op_ids:
+                return "duplicate", None, "duplicate_op_id"
+            stack = self.undo_stacks.get(username, [])
+            if not stack:
+                return "empty", None, "nothing to undo"
+            entry = stack.pop()
+            kind = entry.get("kind")
+
+            if kind == "stroke":
+                sid = entry.get("stroke_id")
+                obj = self.objects.get(sid) if isinstance(sid, str) else None
+                if obj is None:
+                    # Another user already removed it: no-op, tell the caller.
+                    self.redo_stacks.setdefault(username, []).insert(0, entry) if False else None
+                    # Do not push to redo; target is gone.
+                    return "noop", None, "target already removed"
+                del self.objects[sid]
+                broadcast = {"type": "undo", "op_id": op_id, "action": "remove_stroke",
+                             "target_id": sid, "user": username}
+            elif kind == "delete":
+                obj = entry.get("object")
+                tid = entry.get("target_id")
+                if isinstance(obj, dict) and isinstance(tid, str) and tid not in self.objects:
+                    self.objects[tid] = dict(obj)
+                broadcast = {"type": "undo", "op_id": op_id, "action": "restore_object",
+                             "object": dict(obj) if isinstance(obj, dict) else None, "user": username}
+            elif kind == "clear":
+                for o in entry.get("cleared", []):
+                    if isinstance(o, dict) and "id" in o and o["id"] not in self.objects:
+                        self.objects[o["id"]] = dict(o)
+                broadcast = {"type": "undo", "op_id": op_id, "action": "restore_objects",
+                             "objects": [dict(o) for o in entry.get("cleared", [])], "user": username}
+            else:
+                # Unknown entry: put it back and report.
+                stack.append(entry)
+                return "invalid", None, "unknown undo entry"
+
+            self.seq += 1
+            broadcast["seq"] = self.seq
+            broadcast["ts"] = time.time()
+            self.seen_op_ids.add(op_id)
+            self.op_log.append(broadcast)
+            self.dirty = True
+            self.redo_stacks.setdefault(username, []).append(entry)
+            return "ok", broadcast, ""
+
+    def redo(self, op_id: Any, username: str) -> Tuple[str, Optional[dict[str, Any]], str]:
+        with self.lock:
+            if not isinstance(op_id, str) or not op_id.strip():
+                return "invalid", None, "bad_op_id"
+            if op_id in self.seen_op_ids:
+                return "duplicate", None, "duplicate_op_id"
+            stack = self.redo_stacks.get(username, [])
+            if not stack:
+                return "empty", None, "nothing to redo"
+            entry = stack.pop()
+            kind = entry.get("kind")
+
+            if kind == "stroke":
+                obj = entry.get("object")
+                if isinstance(obj, dict) and "id" in obj and obj["id"] not in self.objects:
+                    self.objects[obj["id"]] = dict(obj)
+                broadcast = {"type": "redo", "op_id": op_id, "action": "add_stroke",
+                             "object": dict(obj) if isinstance(obj, dict) else None, "user": username}
+            elif kind == "delete":
+                tid = entry.get("target_id")
+                if isinstance(tid, str):
+                    self.objects.pop(tid, None)
+                broadcast = {"type": "redo", "op_id": op_id, "action": "remove_stroke",
+                             "target_id": tid, "user": username}
+            elif kind == "clear":
+                ids = [o["id"] for o in entry.get("cleared", []) if isinstance(o, dict) and "id" in o]
+                for tid in ids:
+                    self.objects.pop(tid, None)
+                broadcast = {"type": "redo", "op_id": op_id, "action": "remove_objects",
+                             "target_ids": ids, "user": username}
+            else:
+                stack.append(entry)
+                return "invalid", None, "unknown redo entry"
+
+            self.seq += 1
+            broadcast["seq"] = self.seq
+            broadcast["ts"] = time.time()
+            self.seen_op_ids.add(op_id)
+            self.op_log.append(broadcast)
+            self.dirty = True
+            self.undo_stacks.setdefault(username, []).append(entry)
+            return "ok", broadcast, ""
 
     def ops_since(self, from_seq: Any) -> Optional[dict[str, Any]]:
         with self.lock:

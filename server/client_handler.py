@@ -18,6 +18,10 @@ from protocol import BadMessage, ConnectionClosed, FrameTooLarge, recv_msg, send
 from server.auth import new_token
 from server.room import Participant, Room
 from server.room_manager import RoomManager
+from server import persistence
+from server.auth import LoginLimiter
+
+_LOGIN_LIMITER = LoginLimiter()
 
 # Shared registry for the whole server. Tests may inject their own.
 _DEFAULT_ROOM_MANAGER = RoomManager()
@@ -63,7 +67,17 @@ def handle_client(
         "token": None,
         "last_seen": time.time(),
         "last_ping": time.time(),
+        "kicked": False,
     }
+
+    def do_kick():
+        stop_event.set()
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    state["kick"] = do_kick
 
     def enqueue(msg: dict[str, Any]) -> None:
         if stop_event.is_set():
@@ -218,6 +232,118 @@ def handle_client(
                     }
                 )
                 continue
+            elif mtype == "undo":
+                status, op, reason = room.undo(msg.get("op_id"), state["username"])
+                if status == "duplicate":
+                    continue
+                if status != "ok" or op is None:
+                    enqueue({"type": "error", "code": "rejected_undo", "message": reason or status})
+                    continue
+                room.broadcast(op)
+                continue
+            elif mtype == "redo":
+                status, op, reason = room.redo(msg.get("op_id"), state["username"])
+                if status == "duplicate":
+                    continue
+                if status != "ok" or op is None:
+                    enqueue({"type": "error", "code": "rejected_redo", "message": reason or status})
+                    continue
+                room.broadcast(op)
+                continue
+            elif mtype == "clear_canvas":
+                if state.get("role") != "host":
+                    enqueue({"type": "error", "code": "forbidden", "message": "only the host can clear the canvas"})
+                    continue
+                status, op, reason = room.clear_canvas(msg.get("op_id"), state["username"])
+                if status == "duplicate":
+                    continue
+                if status != "ok" or op is None:
+                    enqueue({"type": "error", "code": "rejected_clear", "message": reason or status})
+                    continue
+                room.dirty = True
+                room.broadcast(op)
+                continue
+            elif mtype == "role_change":
+                if state.get("role") != "host":
+                    enqueue({"type": "error", "code": "forbidden", "message": "only the host can change roles"})
+                    continue
+                target = msg.get("target")
+                new_role = msg.get("role")
+                if not isinstance(target, str) or target not in room.participants:
+                    enqueue({"type": "error", "code": "bad_request", "message": "unknown target"})
+                    continue
+                if new_role not in ("host", "editor", "viewer"):
+                    enqueue({"type": "error", "code": "bad_request", "message": "invalid role"})
+                    continue
+                with room.lock:
+                    p = room.participants[target]
+                    p.role = new_role
+                    if p.state is not None:
+                        p.state["role"] = new_role
+                    room.broadcast({"type": "participant_list", "users": room.participant_list()})
+                continue
+            elif mtype == "kick":
+                if state.get("role") != "host":
+                    enqueue({"type": "error", "code": "forbidden", "message": "only the host can kick"})
+                    continue
+                target = msg.get("target")
+                with room.lock:
+                    p = room.participants.get(target) if isinstance(target, str) else None
+                    if p is None:
+                        enqueue({"type": "error", "code": "bad_request", "message": "unknown target"})
+                        continue
+                    p.kicked = True
+                    room.participants.pop(target, None)
+                    room.broadcast({"type": "user_left", "username": target})
+                    room.broadcast({"type": "participant_list", "users": room.participant_list()})
+                if p.kick is not None:
+                    p.kick()
+                continue
+            elif mtype == "lock_room":
+                if state.get("role") != "host":
+                    enqueue({"type": "error", "code": "forbidden", "message": "only the host can lock the room"})
+                    continue
+                locked = bool(msg.get("locked", False))
+                room.locked = locked
+                with room.lock:
+                    room.broadcast({"type": "participant_list", "users": room.participant_list()})
+                continue
+            elif mtype == "save_board":
+                if state.get("role") != "host":
+                    enqueue({"type": "error", "code": "forbidden", "message": "only the host can save"})
+                    continue
+                name = msg.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    enqueue({"type": "error", "code": "bad_request", "message": "name required"})
+                    continue
+                safe = "".join(ch for ch in name if ch.isalnum() or ch in "-_").strip()
+                if not safe:
+                    enqueue({"type": "error", "code": "bad_request", "message": "invalid name"})
+                    continue
+                persistence.save_board(room, safe)
+                room.dirty = False
+                enqueue({"type": "save_ok", "name": safe})
+                continue
+            elif mtype == "load_board":
+                if state.get("role") != "host":
+                    enqueue({"type": "error", "code": "forbidden", "message": "only the host can load"})
+                    continue
+                name = msg.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    enqueue({"type": "error", "code": "bad_request", "message": "name required"})
+                    continue
+                safe = "".join(ch for ch in name if ch.isalnum() or ch in "-_").strip()
+                data = persistence.load_room(safe)
+                if data is None:
+                    enqueue({"type": "error", "code": "not_found", "message": "board not found"})
+                    continue
+                persistence.apply_loaded(room, data)
+                enqueue({"type": "load_ok", "name": safe})
+                room.broadcast({"type": "snapshot", **room.snapshot()})
+                continue
+            elif mtype == "list_boards":
+                enqueue({"type": "boards_list", "boards": persistence.list_boards()})
+                continue
             else:
                 enqueue({"type": "error", "code": "unknown_type", "message": f"unknown message type: {mtype}"})
     finally:
@@ -231,7 +357,7 @@ def handle_client(
         except Exception:
             pass
 
-        if state["joined"] and not state["left_cleanly"]:
+        if state["joined"] and not state["left_cleanly"] and not state.get("kicked"):
             room = rm.get(state["room_code"]) if state["room_code"] else None
             if room is not None:
                 username = state["username"]
@@ -277,7 +403,8 @@ def _handle_create_room(msg, state, rm, enqueue, log, peer) -> None:
     color = room.next_color()
     token = new_token()
 
-    participant = Participant(username=username, color=color, role="host", token=token, send=enqueue)
+    participant = Participant(username=username, color=color, role="host", token=token, send=enqueue,
+                             state=state, kick=state.get("kick"))
     with room.lock:
         room.participants[username] = participant
         participants = room.participant_list()
@@ -295,6 +422,7 @@ def _handle_create_room(msg, state, rm, enqueue, log, peer) -> None:
 
 
 def _handle_join_room(msg, state, rm, enqueue, log, peer) -> None:
+    ip = peer.split(":")[0]
     username = _validate_username(msg, enqueue)
     if username is None:
         return
@@ -306,6 +434,10 @@ def _handle_join_room(msg, state, rm, enqueue, log, peer) -> None:
     password = msg.get("password")
     if password is not None and not isinstance(password, str):
         enqueue({"type": "join_denied", "reason": "bad_request", "message": "password must be a string"})
+        return
+
+    if _LOGIN_LIMITER.is_locked(ip):
+        enqueue({"type": "join_denied", "reason": "too_many_attempts", "message": "too many failed attempts, try later"})
         return
 
     room = rm.get(room_code)
@@ -321,12 +453,19 @@ def _handle_join_room(msg, state, rm, enqueue, log, peer) -> None:
             enqueue({"type": "join_denied", "reason": "username_taken", "message": "username already in room"})
             return
         if not room.check_password(password if isinstance(password, str) else None):
-            enqueue({"type": "join_denied", "reason": "wrong_password", "message": "incorrect password"})
+            locked = _LOGIN_LIMITER.record_failure(ip)
+            reason = "too_many_attempts" if locked else "wrong_password"
+            msg_text = "too many failed attempts, try later" if locked else "incorrect password"
+            enqueue({"type": "join_denied", "reason": reason, "message": msg_text})
             return
 
-        color = room.next_color()
-        token = new_token()
-        participant = Participant(username=username, color=color, role="editor", token=token, send=enqueue)
+    _LOGIN_LIMITER.record_success(ip)
+
+    color = room.next_color()
+    token = new_token()
+    participant = Participant(username=username, color=color, role="editor", token=token, send=enqueue,
+                             state=state, kick=state.get("kick"))
+    with room.lock:
         room.participants[username] = participant
         participants = room.participant_list()
 

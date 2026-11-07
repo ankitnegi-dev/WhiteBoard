@@ -40,9 +40,11 @@ Example:
 
 ### Participants
 
-- user_joined, user_left, user_disconnected, user_reconnected
+- user_joined, user_left, user_disconnected, user_reconnected, kicked
 - participant_list {users: [{name, color, role, online}]}
 - role_change {target, role} (host only)
+- kick {target} (host only)
+- lock_room {locked} (host only)
 - cursor_move {x, y} (throttled to about 20 per second, not logged)
 
 ### Drawing ops (go into the op log)

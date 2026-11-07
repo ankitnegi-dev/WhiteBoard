@@ -16,12 +16,12 @@ from typing import Any, Optional
 
 try:
     import tkinter as tk
-    from tkinter import ttk, colorchooser, messagebox
+    from tkinter import ttk, colorchooser, messagebox, simpledialog
 except ImportError as exc:  # pragma: no cover - handled in main.py
     raise
 
 from client.net import NetworkClient
-from client.state import BoardState, canvas_to_logical, compute_scale
+from client.state import BoardState, canvas_to_logical, compute_scale, logical_to_canvas
 from client.tools import find_stroke_at
 
 # --------------------------------------------------------------------------- #
@@ -63,7 +63,7 @@ class WhiteboardApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("LAN Collaborative Whiteboard")
-        self.root.geometry("1200x760")
+        self.root.geometry("1280x800")
         self.root.minsize(1100, 700)
 
         self.theme_name = "light"
@@ -95,28 +95,64 @@ class WhiteboardApp:
     # Connect screen
     # ------------------------------------------------------------------ #
     def _show_connect(self) -> None:
-        self.connect_frame = ttk.Frame(self.root, padding=24)
+        self.connect_frame = ttk.Frame(self.root, padding=0)
         self.connect_frame.pack(fill="both", expand=True)
 
-        title = ttk.Label(self.connect_frame, text="LAN Collaborative Whiteboard", font=("Segoe UI", 20, "bold"))
-        title.pack(pady=(0, 16))
+        # Centered card.
+        wrapper = ttk.Frame(self.connect_frame)
+        wrapper.place(relx=0.5, rely=0.5, anchor="center")
 
-        form = ttk.Frame(self.connect_frame)
+        card = ttk.Frame(wrapper, padding=32, relief="solid", borderwidth=1)
+        card.pack()
+
+        title = ttk.Label(card, text="LAN Collaborative Whiteboard", font=("Segoe UI", 24, "bold"))
+        title.pack(pady=(0, 4))
+        subtitle = ttk.Label(card, text="Connect to a server on your LAN", font=("Segoe UI", 11))
+        subtitle.pack(pady=(0, 16))
+
+        self.connect_mode = tk.StringVar(value="create")
+        tabs = ttk.Frame(card)
+        tabs.pack(pady=(0, 12))
+        ttk.Radiobutton(tabs, text="Create room", variable=self.connect_mode, value="create",
+                        command=self._update_connect_mode).pack(side="left", padx=8)
+        ttk.Radiobutton(tabs, text="Join room", variable=self.connect_mode, value="join",
+                        command=self._update_connect_mode).pack(side="left", padx=8)
+
+        form = ttk.Frame(card)
         form.pack()
 
         self._add_field(form, "Server IP", "host", "127.0.0.1", 0)
         self._add_field(form, "Port", "port", "5050", 1)
         self._add_field(form, "Username", "username", "", 2)
-        self._add_field(form, "Room code", "room_code", "", 3)
+        self.room_code_row = 3
+        self._add_field(form, "Room code", "room_code", "", self.room_code_row)
         self._add_field(form, "Password", "password", "", 4, show="*")
 
-        btns = ttk.Frame(form)
-        btns.grid(row=5, column=0, columnspan=2, pady=(16, 0))
-        ttk.Button(btns, text="Create room", command=lambda: self._start_connect("create")).pack(side="left", padx=4)
-        ttk.Button(btns, text="Join room", command=lambda: self._start_connect("join")).pack(side="left", padx=4)
+        self.room_code_hint = ttk.Label(card, text="The server generates the room code for you.", font=("Segoe UI", 9, "italic"))
+        self.room_code_hint.pack(pady=(4, 0))
 
-        self.connect_status = ttk.Label(self.connect_frame, text="", foreground="#B83A2E")
+        self.connect_status = ttk.Label(card, text="", foreground="#B83A2E", font=("Segoe UI", 10))
         self.connect_status.pack(pady=(12, 0))
+
+        self.connect_button = ttk.Button(card, text="Create room", command=lambda: self._start_connect(self.connect_mode.get()))
+        self.connect_button.pack(pady=(12, 0), ipadx=12, ipady=4)
+
+        self._update_connect_mode()
+
+    def _update_connect_mode(self):
+        mode = self.connect_mode.get()
+        parent = self.entry_room_code.master
+        row_widgets = parent.grid_slaves(row=self.room_code_row)
+        if mode == "create":
+            for w in row_widgets:
+                w.grid_remove()
+            self.room_code_hint.config(text="The server generates the room code for you.")
+            self.connect_button.config(text="Create room")
+        else:
+            for w in row_widgets:
+                w.grid()
+            self.room_code_hint.config(text="Enter the 6-character code from the host.")
+            self.connect_button.config(text="Join room")
 
     def _add_field(self, parent, label, key, default, row, show=None):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4, padx=(0, 8))
@@ -224,14 +260,42 @@ class WhiteboardApp:
         self.toolbar.pack(side="left", fill="y")
         self.toolbar.pack_propagate(False)
 
+        self.tool_buttons = {}
         self._tool_button("Pen", "pen")
         self._tool_button("Eraser", "eraser")
         ttk.Separator(self.toolbar, orient="horizontal").pack(fill="x", pady=8)
 
-        self.color_btn = ttk.Button(self.toolbar, text="Color", command=self._pick_color)
+        self.color_btn = ttk.Button(self.toolbar, text="Color", command=self._pick_color, style="Tool.TButton")
         self.color_btn.pack(fill="x", pady=4)
-        self.color_swatch = tk.Label(self.toolbar, text="  ", bg=self.color, width=4, relief="solid")
+        self.color_swatch = tk.Label(self.toolbar, text="  ", bg=self.color, width=4, relief="solid", borderwidth=1)
         self.color_swatch.pack(pady=4)
+
+        ttk.Label(self.toolbar, text="Width", font=("Segoe UI", 9)).pack(pady=(8, 0))
+        width_row = ttk.Frame(self.toolbar)
+        width_row.pack(fill="x", pady=2)
+        self.width_scale = ttk.Scale(width_row, from_=1, to=20, orient="horizontal", command=self._on_width)
+        self.width_scale.set(self.width)
+        self.width_scale.pack(side="left", fill="x", expand=True)
+        self.width_value = ttk.Label(width_row, text=f"{int(self.width)}", width=3)
+        self.width_value.pack(side="left", padx=4)
+        self.width_preview = tk.Canvas(self.toolbar, width=56, height=20, highlightthickness=0)
+        self.width_preview.pack(pady=2)
+        self._update_width_preview()
+
+        ttk.Separator(self.toolbar, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Button(self.toolbar, text="Undo", command=self._undo).pack(fill="x", pady=2)
+        ttk.Button(self.toolbar, text="Redo", command=self._redo).pack(fill="x", pady=2)
+        self.clear_btn = ttk.Button(self.toolbar, text="Clear", command=self._clear_canvas)
+        self.clear_btn.pack(fill="x", pady=2)
+        self.save_btn = ttk.Button(self.toolbar, text="Save", command=self._save_board)
+        self.save_btn.pack(fill="x", pady=2)
+        self.load_btn = ttk.Button(self.toolbar, text="Load", command=self._load_board)
+        self.load_btn.pack(fill="x", pady=2)
+
+        if self.role != "host":
+            self.clear_btn.state(["disabled"])
+            self.save_btn.state(["disabled"])
+            self.load_btn.state(["disabled"])
 
         ttk.Label(self.toolbar, text="Width").pack(pady=(8, 0))
         self.width_scale = ttk.Scale(self.toolbar, from_=1, to=20, orient="vertical", command=self._on_width)
@@ -258,6 +322,15 @@ class WhiteboardApp:
         self.right.pack(side="right", fill="y")
         self.right.pack_propagate(False)
 
+        room_header = ttk.Frame(self.right)
+        room_header.pack(fill="x", pady=(0, 8))
+        ttk.Label(room_header, text="Room code", font=("Segoe UI", 9)).pack(anchor="w")
+        code_row = ttk.Frame(room_header)
+        code_row.pack(fill="x")
+        self.room_code_label = ttk.Label(code_row, text=self.room_code, font=("Segoe UI", 16, "bold"))
+        self.room_code_label.pack(side="left")
+        ttk.Button(code_row, text="Copy", command=self._copy_room_code, width=6).pack(side="right")
+
         ttk.Label(self.right, text="Participants", font=("Segoe UI", 11, "bold")).pack(anchor="w")
         self.participants_frame = ttk.Frame(self.right)
         self.participants_frame.pack(fill="x", pady=(4, 8))
@@ -271,6 +344,23 @@ class WhiteboardApp:
         self.chat_entry.pack(side="left", fill="x", expand=True)
         self.chat_entry.bind("<Return>", lambda _e: self._send_chat())
         ttk.Button(chat_input, text="Send", command=self._send_chat).pack(side="left", padx=4)
+
+        if self.role == "host":
+            ttk.Separator(self.right, orient="horizontal").pack(fill="x", pady=8)
+            ttk.Label(self.right, text="Host controls", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+            hc = ttk.Frame(self.right)
+            hc.pack(fill="x", pady=4)
+            ttk.Label(hc, text="Target").grid(row=0, column=0, sticky="w")
+            self.host_target = ttk.Combobox(hc, values=[], width=12)
+            self.host_target.grid(row=0, column=1, padx=4)
+            ttk.Label(hc, text="Role").grid(row=1, column=0, sticky="w")
+            self.host_role = ttk.Combobox(hc, values=["host", "editor", "viewer"], width=12)
+            self.host_role.set("editor")
+            self.host_role.grid(row=1, column=1, padx=4)
+            ttk.Button(hc, text="Apply role", command=self._apply_role).grid(row=2, column=0, columnspan=2, pady=4, sticky="ew")
+            ttk.Button(hc, text="Kick", command=self._kick_user).grid(row=3, column=0, columnspan=2, pady=4, sticky="ew")
+            self.lock_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(hc, text="Lock room", variable=self.lock_var, command=self._toggle_lock).grid(row=4, column=0, columnspan=2, sticky="w")
 
         # Status bar.
         self.status_bar = ttk.Frame(self.root, padding=(8, 2))
@@ -289,6 +379,10 @@ class WhiteboardApp:
             self.root.bind(f"{mod}p>", lambda _e: self._set_tool("pen"))
             self.root.bind(f"{mod}e>", lambda _e: self._set_tool("eraser"))
             self.root.bind(f"{mod}t>", lambda _e: self._toggle_theme())
+            self.root.bind(f"{mod}z>", lambda _e: self._undo())
+            self.root.bind(f"{mod}y>", lambda _e: self._redo())
+        self.root.bind("<Control-Shift-Z>", lambda _e: self._redo())
+        self.root.bind("<Command-Shift-Z>", lambda _e: self._redo())
         self.root.bind("<Escape>", lambda _e: self._set_tool("pen"))
 
         # Mouse wheel for width (cross-platform).
@@ -297,11 +391,15 @@ class WhiteboardApp:
         self.canvas.bind("<Button-5>", lambda e: self._adjust_width(-1))
 
     def _tool_button(self, label, tool):
-        btn = ttk.Button(self.toolbar, text=label, command=lambda: self._set_tool(tool))
+        btn = ttk.Button(self.toolbar, text=label, command=lambda: self._set_tool(tool), style="Tool.TButton")
         btn.pack(fill="x", pady=4)
+        self.tool_buttons[tool] = btn
+        Tooltip(btn, f"Select {label.lower()} tool")
 
     def _set_tool(self, tool):
         self.tool = tool
+        for t, btn in self.tool_buttons.items():
+            btn.configure(style="ToolActive.TButton" if t == tool else "Tool.TButton")
         self.status_conn.config(text=f"Tool: {tool}")
 
     def _pick_color(self):
@@ -310,11 +408,32 @@ class WhiteboardApp:
             self.color = res[1]
             self.color_swatch.config(bg=self.color)
 
+    def _copy_room_code(self):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.room_code)
+            self._toast("Room code copied.")
+        except tk.TclError:
+            self._toast("Could not copy.")
+
     def _on_width(self, _val):
         try:
             self.width = float(self.width_scale.get())
         except (TypeError, ValueError):
             pass
+        if hasattr(self, "width_value"):
+            self.width_value.config(text=f"{int(self.width)}")
+        self._update_width_preview()
+
+    def _update_width_preview(self):
+        if not hasattr(self, "width_preview"):
+            return
+        c = self.width_preview
+        c.delete("all")
+        c.configure(bg=self.theme["bg"])
+        y = 10
+        c.create_oval(4, y - self.width / 2, 4 + self.width, y + self.width / 2,
+                      fill=self.color, outline="")
 
     def _adjust_width(self, delta):
         self.width = max(1.0, min(20.0, self.width + delta))
@@ -344,10 +463,18 @@ class WhiteboardApp:
         style.configure("TLabel", background=t["bg"], foreground=t["ink"])
         style.configure("TButton", background=t["accent"], foreground="#FFFFFF", padding=6)
         style.map("TButton", background=[("active", t["accent_hover"])])
+        style.configure("Tool.TButton", background=t["surface"], foreground=t["ink"], padding=4)
+        style.map("Tool.TButton", background=[("active", t["surface_alt"])])
+        style.configure("ToolActive.TButton", background=t["highlight"], foreground=t["ink"], padding=4)
         style.configure("TEntry", fieldbackground=t["surface"], foreground=t["ink"])
+        style.configure("TCombobox", fieldbackground=t["surface"], foreground=t["ink"])
         style.configure("TScale", background=t["bg"])
         self.root.configure(bg=t["bg"])
         self.canvas.configure(bg=t["canvas"])
+        if hasattr(self, "chat_text"):
+            self.chat_text.configure(bg=t["surface"], fg=t["ink"], insertbackground=t["ink"])
+        if hasattr(self, "width_preview"):
+            self.width_preview.configure(bg=t["bg"])
 
     # ------------------------------------------------------------------ #
     # Canvas geometry
@@ -516,8 +643,67 @@ class WhiteboardApp:
             self._rebuild_participants()
             self._redraw_all()
             return
+        if mtype == "undo":
+            action = msg.get("action")
+            if action == "remove_stroke":
+                tid = msg.get("target_id")
+                if isinstance(tid, str):
+                    item = self.canvas_items.pop(tid, None)
+                    if item is not None:
+                        self.canvas.delete(item)
+                    self.state.objects.pop(tid, None)
+            elif action == "restore_object":
+                obj = msg.get("object")
+                if isinstance(obj, dict) and "id" in obj:
+                    self.state.objects[obj["id"]] = obj
+                    self._add_stroke_item(obj)
+            elif action == "restore_objects":
+                for obj in msg.get("objects", []):
+                    if isinstance(obj, dict) and "id" in obj:
+                        self.state.objects[obj["id"]] = obj
+                        self._add_stroke_item(obj)
+            return
+        if mtype == "redo":
+            action = msg.get("action")
+            if action == "add_stroke":
+                obj = msg.get("object")
+                if isinstance(obj, dict) and "id" in obj:
+                    self.state.objects[obj["id"]] = obj
+                    self._add_stroke_item(obj)
+            elif action == "remove_stroke":
+                tid = msg.get("target_id")
+                if isinstance(tid, str):
+                    item = self.canvas_items.pop(tid, None)
+                    if item is not None:
+                        self.canvas.delete(item)
+                    self.state.objects.pop(tid, None)
+            elif action == "remove_objects":
+                for tid in msg.get("target_ids", []):
+                    if isinstance(tid, str):
+                        item = self.canvas_items.pop(tid, None)
+                        if item is not None:
+                            self.canvas.delete(item)
+                        self.state.objects.pop(tid, None)
+            return
+        if mtype == "clear_canvas":
+            self.canvas.delete("all")
+            self.canvas_items.clear()
+            self.state.objects.clear()
+            return
+        if mtype == "kicked":
+            self._toast("You were kicked from the room.")
+            if self.net:
+                self.net.disconnect()
+            return
+        if mtype in ("save_ok", "load_ok"):
+            self._toast(f"{mtype.replace('_ok', '').capitalize()} successful.")
+            return
+        if mtype == "boards_list":
+            boards = msg.get("boards", [])
+            self._toast("Boards: " + ", ".join(boards) if boards else "No saved boards.")
+            return
         if mtype == "error":
-            self.status_conn.config(text=f"Error: {msg.get('message', msg.get('code'))}")
+            self._toast(f"Rejected: {msg.get('message', msg.get('code'))}")
             return
 
     def _render_op(self, op: dict[str, Any]) -> None:
@@ -547,8 +733,33 @@ class WhiteboardApp:
                     self.canvas.coords(item, *flat)
         # stroke_end needs no visual change.
 
+    def _add_stroke_item(self, obj: dict[str, Any]) -> None:
+        sid = obj.get("id")
+        if not isinstance(sid, str) or sid in self.canvas_items:
+            return
+        pts = obj.get("points", [])
+        if not isinstance(pts, list) or not pts:
+            pts = [[0, 0], [0, 0]]
+        if len(pts) == 1:
+            pts = [pts[0], pts[0]]
+        flat = [c for pt in pts for c in pt]
+        color = obj.get("color", "#000000")
+        width = obj.get("width", 2)
+        item = self.canvas.create_line(*flat, fill=color, width=width,
+                                       capstyle="round", smooth=True, tags=(sid,))
+        self.canvas_items[sid] = item
+
+    def _draw_board_background(self) -> None:
+        self.canvas.delete("board_bg")
+        x0, y0 = logical_to_canvas(0, 0, self.offset_x, self.offset_y, self.scale)
+        x1, y1 = logical_to_canvas(1600, 900, self.offset_x, self.offset_y, self.scale)
+        self.canvas.create_rectangle(x0, y0, x1, y1, fill=self.theme["surface"],
+                                     outline=self.theme["border"], width=1, tags=("board_bg",))
+        self.canvas.tag_lower("board_bg")
+
     def _redraw_all(self) -> None:
         self.canvas.delete("all")
+        self._draw_board_background()
         self.canvas_items.clear()
         for sid, obj in self.state.objects.items():
             pts = obj.get("points", [])
@@ -572,6 +783,8 @@ class WhiteboardApp:
     def _rebuild_participants(self) -> None:
         for w in self.participants_frame.winfo_children():
             w.destroy()
+        if hasattr(self, "host_target"):
+            self.host_target["values"] = [u.get("name", "") for u in self.state.participants]
         for u in self.state.participants:
             row = ttk.Frame(self.participants_frame)
             row.pack(fill="x", pady=2)
@@ -592,8 +805,19 @@ class WhiteboardApp:
             ts = time.strftime("%H:%M", time.localtime(timestamp)) if timestamp else ""
         except (TypeError, ValueError, OSError):
             ts = ""
-        self.chat_text.insert("end", f"{user}  {ts}\n", "name")
-        self.chat_text.insert("end", f"  {text}\n")
+        color = "#1E5B6B"
+        for u in self.state.participants:
+            if u.get("name") == user:
+                color = u.get("color", color)
+        name_tag = f"name_{user}"
+        self.chat_text.tag_configure(name_tag, foreground=color, font=("Segoe UI", 10, "bold"))
+        self.chat_text.tag_configure("time_tag", foreground=self.theme["ink_muted"], font=("Segoe UI", 9))
+        self.chat_text.tag_configure("body_tag", foreground=self.theme["ink"], font=("Segoe UI", 10))
+        self.chat_text.insert("end", f"{user}", name_tag)
+        if ts:
+            self.chat_text.insert("end", f"  {ts}", "time_tag")
+        self.chat_text.insert("end", "\n")
+        self.chat_text.insert("end", f"{text}\n", "body_tag")
         self.chat_text.see("end")
         self.chat_text.config(state="disabled")
 
@@ -603,6 +827,56 @@ class WhiteboardApp:
             return
         self.chat_entry.delete(0, "end")
         self.net.send({"type": "chat", "text": text})
+
+    def _undo(self):
+        if self.net:
+            self.net.send({"type": "undo", "op_id": str(uuid.uuid4())})
+
+    def _redo(self):
+        if self.net:
+            self.net.send({"type": "redo", "op_id": str(uuid.uuid4())})
+
+    def _clear_canvas(self):
+        if self.net and self.role == "host":
+            self.net.send({"type": "clear_canvas", "op_id": str(uuid.uuid4())})
+
+    def _save_board(self):
+        if not self.net or self.role != "host":
+            return
+        name = tk.simpledialog.askstring("Save board", "Board name:", parent=self.root)
+        if name:
+            self.net.send({"type": "save_board", "name": name})
+
+    def _load_board(self):
+        if not self.net or self.role != "host":
+            return
+        name = tk.simpledialog.askstring("Load board", "Board name:", parent=self.root)
+        if name:
+            self.net.send({"type": "load_board", "name": name})
+
+    def _apply_role(self):
+        if not self.net or self.role != "host":
+            return
+        target = self.host_target.get().strip()
+        new_role = self.host_role.get().strip()
+        if target:
+            self.net.send({"type": "role_change", "target": target, "role": new_role})
+
+    def _kick_user(self):
+        if not self.net or self.role != "host":
+            return
+        target = self.host_target.get().strip()
+        if target:
+            self.net.send({"type": "kick", "target": target})
+
+    def _toggle_lock(self):
+        if self.net and self.role == "host":
+            self.net.send({"type": "lock_room", "locked": bool(self.lock_var.get())})
+
+    def _toast(self, text):
+        self.status_conn.config(text=text)
+        self.root.after(3000, lambda: self.status_conn.config(
+            text="Connected" if (self.net and self.net.connected) else "Disconnected"))
 
     # ------------------------------------------------------------------ #
     # Cursors
@@ -635,3 +909,29 @@ class WhiteboardApp:
             return
         self.status_conn.config(text="Connected" if self.net.connected else "Disconnected")
         self.status_room.config(text=f"room: {self.room_code}")
+
+
+class Tooltip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tip = None
+        widget.bind("<Enter>", self.show)
+        widget.bind("<Leave>", self.hide)
+
+    def show(self, _event=None):
+        if self.tip is not None:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        lbl = tk.Label(tw, text=self.text, background="#FFFFE0", relief="solid", borderwidth=1,
+                       font=("Segoe UI", 9), padx=4, pady=2)
+        lbl.pack()
+
+    def hide(self, _event=None):
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
