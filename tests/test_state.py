@@ -37,6 +37,13 @@ def test_canvas_to_logical_clamps():
     assert lx == 0.0
     assert ly == 900.0
 
+def test_board_bounds_clamp():
+    scale, ox, oy = compute_scale(1600, 900)
+    # Outside left/top clamps to 0.
+    assert canvas_to_logical(-10, -10, 1600, 900, ox, oy, scale) == (0.0, 0.0)
+    # Outside right/bottom clamps to max.
+    assert canvas_to_logical(2000, 1000, 1600, 900, ox, oy, scale) == (1600.0, 900.0)
+
 
 def test_gap_detection_and_duplicate():
     state = BoardState()

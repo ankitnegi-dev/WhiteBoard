@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 from protocol import BadMessage, ConnectionClosed, FrameTooLarge, recv_msg, send_msg
 from server.auth import new_token
-from server.room import Participant, Room
+from server.room import Participant
 from server.room_manager import RoomManager
 from server import persistence
 from server.auth import LoginLimiter

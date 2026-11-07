@@ -11,7 +11,7 @@ import hashlib
 import secrets
 import threading
 import time
-from typing import Any, Optional, Tuple
+from typing import Any, Tuple
 
 
 def hash_password(password: str) -> Tuple[str, str]:

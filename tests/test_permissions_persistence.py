@@ -11,8 +11,6 @@ import subprocess
 import sys
 import time
 
-import pytest
-
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOMS_DIR = os.path.join(ROOT, "rooms")
 
@@ -394,8 +392,8 @@ def test_save_load_roundtrip():
         a = socket.create_connection(("127.0.0.1", port1), timeout=3)
         a.settimeout(3)
         _send(a, {"type": "create_room", "username": "alice"})
-        code = _recv(a)["room_code"]
-        _recv(a)
+        _recv(a)  # room_created
+        _recv(a)  # participant_list
 
         sid = "stroke-p"
         _send(a, {"type": "stroke_start", "op_id": "p1", "stroke_id": sid, "tool": "pen",

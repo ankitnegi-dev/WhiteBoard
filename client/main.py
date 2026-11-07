@@ -7,9 +7,6 @@ ImportError traceback.
 
 from __future__ import annotations
 
-import sys
-
-
 def main() -> int:
     try:
         import tkinter  # noqa: F401

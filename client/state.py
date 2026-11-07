@@ -8,7 +8,7 @@ a gap that requires a resync.
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 
 LOGICAL_WIDTH = 1600

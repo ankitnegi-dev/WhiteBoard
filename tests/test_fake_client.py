@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import io
 import socket
 import struct
 import threading
 import time
-
-import pytest
 
 import tests.fake_client as fc
 

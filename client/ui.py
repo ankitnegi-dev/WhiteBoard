@@ -17,8 +17,8 @@ from typing import Any, Optional
 
 try:
     import tkinter as tk
-    from tkinter import ttk, colorchooser, messagebox, simpledialog
-except ImportError as exc:  # pragma: no cover - handled in main.py
+    from tkinter import ttk, colorchooser, simpledialog
+except ImportError:  # pragma: no cover - handled in main.py
     raise
 
 from client.net import NetworkClient
@@ -63,6 +63,7 @@ USER_COLORS_FALLBACK = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4"]
 class WhiteboardApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
+        self.root.report_callback_exception = self._report_exception
         self.root.title("LAN Collaborative Whiteboard")
         self.root.geometry("1280x800")
         self.root.minsize(1100, 700)
@@ -478,7 +479,7 @@ class WhiteboardApp:
         c.configure(bg=self.theme["bg"])
         y = 10
         c.create_oval(4, y - self.width / 2, 4 + self.width, y + self.width / 2,
-                      fill=self.color, outline="")
+                      fill=self.theme["accent"], outline="")
 
     def _adjust_width(self, delta):
         self.width = max(1.0, min(20.0, self.width + delta))
@@ -550,6 +551,13 @@ class WhiteboardApp:
     # Drawing input
     # ------------------------------------------------------------------ #
     def _on_press(self, event):
+        # Ignore presses outside the drawable board area.
+        if self.scale <= 0:
+            return
+        raw_lx = (event.x - self.offset_x) / self.scale
+        raw_ly = (event.y - self.offset_y) / self.scale
+        if not (0 <= raw_lx <= 1600 and 0 <= raw_ly <= 900):
+            return
         lx, ly = self._to_logical(event.x, event.y)
         self._last_erased = None
         if self.tool == "pen":
@@ -1049,14 +1057,14 @@ class WhiteboardApp:
     def _save_board(self):
         if not self.net or self.role != "host":
             return
-        name = tk.simpledialog.askstring("Save board", "Board name:", parent=self.root)
+        name = simpledialog.askstring("Save board", "Board name:", parent=self.root)
         if name:
             self.net.send({"type": "save_board", "name": name})
 
     def _load_board(self):
         if not self.net or self.role != "host":
             return
-        name = tk.simpledialog.askstring("Load board", "Board name:", parent=self.root)
+        name = simpledialog.askstring("Load board", "Board name:", parent=self.root)
         if name:
             self.net.send({"type": "load_board", "name": name})
 
@@ -1093,6 +1101,16 @@ class WhiteboardApp:
         self.status_conn.config(text=text)
         self.root.after(3000, lambda: self.status_conn.config(
             text="Connected" if (self.net and self.net.connected) else "Disconnected"))
+
+    def _report_exception(self, exc_type, exc_value, exc_tb):
+        import traceback
+        logging.getLogger("whiteboard.ui").error("unhandled UI exception: %s", "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+        if not getattr(self, "_poll_error_shown", False):
+            self._poll_error_shown = True
+            try:
+                self._toast(f"UI error: {exc_value}")
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     # Cursors

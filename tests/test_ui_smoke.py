@@ -83,6 +83,50 @@ def test_smoke_connected_host():
         root.destroy()
 
 
+def _event(x, y):
+    from types import SimpleNamespace
+    return SimpleNamespace(x=x, y=y)
+
+
+def test_eraser_press_queues_delete():
+    root, app = _make_app()
+    try:
+        app.net = FakeNet()
+        app.username = "host"
+        app.room_code = "ABC123"
+        app.role = "host"
+        app.user_color = "#E6194B"
+        app._build_main()
+        app.state.objects["s1"] = {"id": "s1", "type": "stroke", "points": [[10, 10], [20, 10]], "seq": 1}
+        app.tool = "eraser"
+        app._on_press(_event(12, 10))
+        deletes = [m for m in app.net.sent if m.get("type") == "delete_object"]
+        assert deletes and deletes[-1].get("target_id") == "s1"
+    finally:
+        root.destroy()
+
+
+def test_pen_press_motion_release_queues_stroke():
+    root, app = _make_app()
+    try:
+        app.net = FakeNet()
+        app.username = "host"
+        app.room_code = "ABC123"
+        app.role = "host"
+        app.user_color = "#E6194B"
+        app._build_main()
+        app.tool = "pen"
+        app._on_press(_event(5, 5))
+        app._on_motion(_event(10, 10))
+        app._on_release(_event(10, 10))
+        starts = [m for m in app.net.sent if m.get("type") == "stroke_start"]
+        ends = [m for m in app.net.sent if m.get("type") == "stroke_end"]
+        assert starts
+        assert ends
+    finally:
+        root.destroy()
+
+
 def test_smoke_connected_viewer():
     root, app = _make_app()
     try:
