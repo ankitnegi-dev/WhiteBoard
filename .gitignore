@@ -1,0 +1,16 @@
+# Personal files, not for GitHub
+AGENTS.md
+docs/ROADMAP.md
+.opencode/
+
+# Python and build junk
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# Runtime data
+rooms/
