@@ -17,9 +17,12 @@ from server.room import Room
 class RoomManager:
     """Registry mapping room code -> Room."""
 
-    def __init__(self) -> None:
+    def __init__(self, grace_period: float = 120.0,
+                 empty_room_grace: float = 5.0) -> None:
         self._rooms: dict[str, Room] = {}
         self._lock = threading.Lock()
+        self.grace_period = grace_period
+        self.empty_room_grace = empty_room_grace
 
     def get(self, code: str) -> Optional[Room]:
         with self._lock:

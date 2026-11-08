@@ -33,7 +33,7 @@ Example:
 
 - create_room {username, password?} -> room_created {room_code, token, role: host}
 - join_room {username, room_code, password?} -> join_ok {token, role, user_color, participants, snapshot, seq, chat_history} or join_denied {reason, message}. Reasons: room_not_found, room_locked, username_taken, wrong_password, bad_request
-- reconnect {token, room_code, last_seq} -> reconnect_ok {ops_since or snapshot} or reconnect_denied
+- reconnect {token, room_code, last_seq} -> reconnect_ok {ops_since or snapshot, seq} or reconnect_denied {reason, message}. Reasons: invalid_token, token_expired, room_gone, kicked, bad_request
 - leave
 - ping / pong (heartbeat; pong echoes the ping's ts for RTT)
 - error {code, message}
@@ -108,6 +108,26 @@ Example:
   interleave bytes on one socket.
 - Backpressure: a slow client must not stall the room. Use a bounded send
   queue per client; if it overflows, drop the client into resync mode.
+
+### Reconnection and grace period
+
+- A disconnected user stays in the room as offline for a configurable grace
+  period (default 120 s). Their token, role, color and undo/redo stacks are
+  reserved during that time.
+- reconnect validates the token. On success the same username, color, role and
+  undo/redo stacks are restored, the user is marked online again, and the
+  server broadcasts user_reconnected and participant_list.
+- reconnect_ok carries ops_since when last_seq is within MAX_OPS_SINCE of the
+  current seq and the log was not compacted past it; otherwise it carries a
+  snapshot (plus chat_tail) so the client can rebuild from scratch.
+- A second connection that presents the same token while the first socket is
+  still half-open replaces the first socket cleanly; the first socket is
+  closed and its handler exits without marking the user offline.
+- After the grace period the slot is freed and the token expires; a later
+  reconnect is denied with token_expired.
+- If a client's send queue overflows, that client is put into resync mode:
+  further broadcasts may be dropped for it, and it is expected to send
+  resync_request (or reconnect) to catch up. Other clients are not stalled.
 
 ### Undo and redo semantics
 

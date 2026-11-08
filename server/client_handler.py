@@ -1,8 +1,9 @@
 """Per-connection handler thread.
 
-Day 2 replaces the echo with room creation/joining, participant tracking,
-heartbeat and a per-client send queue drained by a writer thread. The send
-queue is what guarantees two threads never interleave bytes on one socket.
+Day 5 replaces per-client watchdog threads with one monitor thread scanning
+all clients, adds reconnect, grace periods, rate limiting and a bounded send
+queue that drops an overflowing client into resync mode instead of stalling
+the room.
 """
 
 from __future__ import annotations
@@ -26,6 +27,61 @@ _LOGIN_LIMITER = LoginLimiter()
 # Shared registry for the whole server. Tests may inject their own.
 _DEFAULT_ROOM_MANAGER = RoomManager()
 
+# Registry of live client records for the single monitor thread.
+_ACTIVE_CLIENTS: dict[int, dict[str, Any]] = {}
+_ACTIVE_CLIENTS_LOCK = threading.Lock()
+
+
+def register_client(record: dict[str, Any]) -> None:
+    with _ACTIVE_CLIENTS_LOCK:
+        _ACTIVE_CLIENTS[id(record)] = record
+
+
+def unregister_client(record: dict[str, Any]) -> None:
+    with _ACTIVE_CLIENTS_LOCK:
+        _ACTIVE_CLIENTS.pop(id(record), None)
+
+
+def monitor_clients(heartbeat_interval: float, heartbeat_timeout: float,
+                    stop_event: Optional[threading.Event] = None) -> None:
+    """Single watchdog thread scanning every client for heartbeat timeouts.
+
+    Design note: one thread for all clients is preferred over per-client
+    watchdogs because it scales with the number of clients without creating
+    a thread per connection, it centralises ping scheduling so intervals stay
+    consistent, and a slow scan cannot be starved by one stuck handler.
+    """
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            break
+        time.sleep(0.5)
+        now = time.time()
+        with _ACTIVE_CLIENTS_LOCK:
+            records = list(_ACTIVE_CLIENTS.values())
+        for rec in records:
+            try:
+                if rec["stop_event"].is_set():
+                    continue
+                last_seen = rec.get("last_seen", now)
+                last_ping = rec.get("last_ping", now)
+                if now - last_seen > heartbeat_timeout:
+                    logging.getLogger("server.client_handler").info(
+                        "heartbeat timeout for %s", rec.get("peer"))
+                    rec["stop_event"].set()
+                    try:
+                        rec["conn"].close()
+                    except OSError:
+                        pass
+                    continue
+                if now - last_ping >= heartbeat_interval:
+                    rec["last_ping"] = now
+                    try:
+                        rec["enqueue"]({"type": "ping"})
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+
 
 def _get_room_manager(room_manager: Optional[RoomManager]) -> RoomManager:
     return room_manager if room_manager is not None else _DEFAULT_ROOM_MANAGER
@@ -47,6 +103,7 @@ def handle_client(
     heartbeat_interval: float = 5.0,
     heartbeat_timeout: float = 15.0,
     room_manager: Optional[RoomManager] = None,
+    rate_limit: float = 60.0,
 ) -> None:
     """Handle one client connection for its whole lifetime."""
     peer = f"{addr[0]}:{addr[1]}"
@@ -60,6 +117,8 @@ def handle_client(
     state: dict[str, Any] = {
         "joined": False,
         "left_cleanly": False,
+        "replaced": False,
+        "resync_mode": False,
         "username": None,
         "room_code": None,
         "role": None,
@@ -68,6 +127,8 @@ def handle_client(
         "last_seen": time.time(),
         "last_ping": time.time(),
         "kicked": False,
+        "op_times": [],
+        "rate_limit": rate_limit,
     }
 
     def do_kick():
@@ -83,14 +144,11 @@ def handle_client(
         if stop_event.is_set():
             return
         try:
-            send_queue.put(msg, timeout=0.5)
+            send_queue.put(msg, timeout=0.1)
         except queue.Full:
-            log.warning("send queue full for %s, dropping client", peer)
-            stop_event.set()
-            try:
-                conn.close()
-            except OSError:
-                pass
+            # Put this client into resync mode instead of stalling the room.
+            state["resync_mode"] = True
+            log.warning("send queue full for %s; client put into resync mode", peer)
 
     def writer() -> None:
         while not stop_event.is_set():
@@ -104,26 +162,28 @@ def handle_client(
                 stop_event.set()
                 break
 
-    def heartbeat() -> None:
-        while not stop_event.is_set():
-            time.sleep(1.0)
-            now = time.time()
-            if now - state["last_seen"] > heartbeat_timeout:
-                log.info("heartbeat timeout for %s", peer)
-                stop_event.set()
-                try:
-                    conn.close()
-                except OSError:
-                    pass
-                break
-            if now - state["last_ping"] >= heartbeat_interval:
-                state["last_ping"] = now
-                enqueue({"type": "ping"})
-
     writer_thread = threading.Thread(target=writer, name=f"writer-{peer}", daemon=True)
-    heartbeat_thread = threading.Thread(target=heartbeat, name=f"heartbeat-{peer}", daemon=True)
     writer_thread.start()
-    heartbeat_thread.start()
+
+    client_record = {
+        "peer": peer,
+        "state": state,
+        "enqueue": enqueue,
+        "conn": conn,
+        "stop_event": stop_event,
+        "last_seen": state["last_seen"],
+        "last_ping": state["last_ping"],
+    }
+    register_client(client_record)
+
+    def _rate_ok() -> bool:
+        now = time.time()
+        window = [t for t in state["op_times"] if now - t < 1.0]
+        state["op_times"] = window
+        if len(window) >= int(max(1, rate_limit)):
+            return False
+        state["op_times"].append(now)
+        return True
 
     log.info("handler started")
     try:
@@ -152,15 +212,15 @@ def handle_client(
                 enqueue({"type": "error", "code": "bad_message", "message": str(exc)})
                 break
             except OSError as exc:
-                # Other socket-level failures are treated as disconnects, not
-                # server errors, so a flaky client cannot spam the log.
                 log.info("%s disconnected (%s)", peer, exc)
                 break
             except Exception as exc:  # pragma: no cover - defensive
                 log.exception("unexpected error from %s: %s", peer, exc)
                 break
 
-            state["last_seen"] = time.time()
+            now = time.time()
+            state["last_seen"] = now
+            client_record["last_seen"] = now
             mtype = msg.get("type") if isinstance(msg, dict) else None
             if not isinstance(msg, dict) or not isinstance(mtype, str):
                 enqueue({"type": "error", "code": "bad_message", "message": "message must be an object with a string type"})
@@ -171,6 +231,8 @@ def handle_client(
                     _handle_create_room(msg, state, rm, enqueue, log, peer)
                 elif mtype == "join_room":
                     _handle_join_room(msg, state, rm, enqueue, log, peer)
+                elif mtype == "reconnect":
+                    _handle_reconnect(msg, state, rm, enqueue, log, peer)
                 else:
                     enqueue({"type": "error", "code": "not_joined", "message": "send create_room or join_room first"})
                 continue
@@ -180,6 +242,13 @@ def handle_client(
             if room is None:
                 enqueue({"type": "error", "code": "room_gone", "message": "room no longer exists"})
                 break
+
+            # Rate limiting for ops.
+            op_types = {"stroke_start", "stroke_points", "stroke_end", "delete_object",
+                        "chat", "undo", "redo", "clear_canvas", "cursor_move"}
+            if mtype in op_types and not _rate_ok():
+                enqueue({"type": "error", "code": "rate_limited", "message": "too many ops per second"})
+                continue
 
             if mtype == "leave":
                 state["left_cleanly"] = True
@@ -209,12 +278,10 @@ def handle_client(
             elif mtype in ("stroke_start", "stroke_points", "stroke_end", "delete_object"):
                 status, op, reason = room.apply_op(msg, state["username"], state["role"])
                 if status == "duplicate":
-                    # Already applied earlier; the original broadcast covers it.
                     continue
                 if status != "ok" or op is None:
                     enqueue({"type": "error", "code": "rejected_op", "message": reason})
                     continue
-                # Broadcast the stamped op to everyone, including the sender.
                 room.broadcast(op)
                 continue
             elif mtype == "chat":
@@ -294,6 +361,8 @@ def handle_client(
                         continue
                     p.kicked = True
                     room.participants.pop(target, None)
+                    if p.token:
+                        room.kicked_tokens.add(p.token)
                     room.broadcast({"type": "user_left", "username": target})
                     room.broadcast({"type": "participant_list", "users": room.participant_list()})
                 if p.kick is not None:
@@ -348,16 +417,13 @@ def handle_client(
                 enqueue({"type": "error", "code": "unknown_type", "message": f"unknown message type: {mtype}"})
     finally:
         stop_event.set()
+        unregister_client(client_record)
         try:
             writer_thread.join(timeout=1.0)
         except Exception:
             pass
-        try:
-            heartbeat_thread.join(timeout=1.0)
-        except Exception:
-            pass
 
-        if state["joined"] and not state["left_cleanly"] and not state.get("kicked"):
+        if state["joined"] and not state["left_cleanly"] and not state.get("kicked") and not state.get("replaced"):
             room = rm.get(state["room_code"]) if state["room_code"] else None
             if room is not None:
                 username = state["username"]
@@ -366,8 +432,9 @@ def handle_client(
                     if p is not None:
                         p.online = False
                         p.send = None
-                    room.broadcast({"type": "user_disconnected", "username": username})
-                    room.broadcast({"type": "participant_list", "users": room.participant_list()})
+                        p.disconnected_at = time.time()
+                room.broadcast({"type": "user_disconnected", "username": username})
+                room.broadcast({"type": "participant_list", "users": room.participant_list()})
         try:
             conn.close()
         except OSError:
@@ -404,7 +471,7 @@ def _handle_create_room(msg, state, rm, enqueue, log, peer) -> None:
     token = new_token()
 
     participant = Participant(username=username, color=color, role="host", token=token, send=enqueue,
-                             state=state, kick=state.get("kick"))
+                              state=state, kick=state.get("kick"))
     with room.lock:
         room.participants[username] = participant
         participants = room.participant_list()
@@ -445,6 +512,15 @@ def _handle_join_room(msg, state, rm, enqueue, log, peer) -> None:
         enqueue({"type": "join_denied", "reason": "room_not_found", "message": "no room with that code"})
         return
 
+    # Prune expired disconnected participants before checking username.
+    now = time.time()
+    with room.lock:
+        expired = [u for u, p in list(room.participants.items())
+                   if not p.online and p.disconnected_at is not None
+                   and now - p.disconnected_at > rm.grace_period]
+        for u in expired:
+            room.participants.pop(u, None)
+
     with room.lock:
         if room.locked:
             enqueue({"type": "join_denied", "reason": "room_locked", "message": "room is locked"})
@@ -464,7 +540,7 @@ def _handle_join_room(msg, state, rm, enqueue, log, peer) -> None:
     color = room.next_color()
     token = new_token()
     participant = Participant(username=username, color=color, role="editor", token=token, send=enqueue,
-                             state=state, kick=state.get("kick"))
+                              state=state, kick=state.get("kick"))
     with room.lock:
         room.participants[username] = participant
         participants = room.participant_list()
@@ -493,6 +569,119 @@ def _handle_join_room(msg, state, rm, enqueue, log, peer) -> None:
         room.broadcast({"type": "user_joined", "username": username, "color": color, "role": "editor"}, exclude=username)
         room.broadcast({"type": "participant_list", "users": room.participant_list()}, exclude=username)
     log.info("%s joined room %s", username, room.code)
+
+
+def _handle_reconnect(msg, state, rm, enqueue, log, peer) -> None:
+    token = msg.get("token")
+    room_code = msg.get("room_code")
+    last_seq = msg.get("last_seq")
+
+    if not isinstance(token, str) or not token.strip():
+        enqueue({"type": "reconnect_denied", "reason": "invalid_token", "message": "token required"})
+        return
+    if not isinstance(room_code, str) or not room_code.strip():
+        enqueue({"type": "reconnect_denied", "reason": "bad_request", "message": "room_code required"})
+        return
+    room_code = room_code.strip().upper()
+
+    room = rm.get(room_code)
+    if room is None:
+        enqueue({"type": "reconnect_denied", "reason": "room_gone", "message": "room no longer exists"})
+        return
+
+    now = time.time()
+    # Prune expired.
+    with room.lock:
+        expired = [u for u, p in list(room.participants.items())
+                   if not p.online and p.disconnected_at is not None
+                   and now - p.disconnected_at > rm.grace_period]
+        for u in expired:
+            room.participants.pop(u, None)
+
+    # Kicked tokens are remembered even after the participant is removed.
+    with room.lock:
+        if token in room.kicked_tokens:
+            kicked = True
+        else:
+            kicked = False
+    if kicked:
+        enqueue({"type": "reconnect_denied", "reason": "kicked", "message": "you were kicked"})
+        return
+
+    # Find participant by token.
+    participant = None
+    with room.lock:
+        for p in room.participants.values():
+            if p.token == token:
+                participant = p
+                break
+
+    if participant is None:
+        enqueue({"type": "reconnect_denied", "reason": "invalid_token", "message": "unknown token"})
+        return
+    if participant.kicked:
+        enqueue({"type": "reconnect_denied", "reason": "kicked", "message": "you were kicked"})
+        return
+    if (not participant.online) and participant.disconnected_at is not None \
+            and now - participant.disconnected_at > rm.grace_period:
+        with room.lock:
+            room.participants.pop(participant.username, None)
+        enqueue({"type": "reconnect_denied", "reason": "token_expired", "message": "reconnection grace period expired"})
+        return
+
+    # Replace old socket if still half-open.
+    old_state = participant.state
+    if old_state is not None and old_state is not state:
+        old_state["replaced"] = True
+    if participant.kick is not None and participant.state is not state:
+        try:
+            participant.kick()
+        except Exception:
+            pass
+
+    username = participant.username
+    color = participant.color
+    role = participant.role
+
+    with room.lock:
+        participant.online = True
+        participant.send = enqueue
+        participant.state = state
+        participant.kick = state.get("kick")
+        participant.disconnected_at = None
+        participants = room.participant_list()
+
+    state["joined"] = True
+    state["username"] = username
+    state["room_code"] = room.code
+    state["role"] = role
+    state["color"] = color
+    state["token"] = token
+
+    # Build reconnect_ok with ops_since or snapshot.
+    result = room.ops_since(last_seq) if isinstance(last_seq, int) and not isinstance(last_seq, bool) else None
+    if result is None:
+        enqueue({
+            "type": "reconnect_ok",
+            "seq": room.seq,
+            "snapshot": room.snapshot(),
+            "chat_history": list(room.chat),
+            "participants": participants,
+        })
+    else:
+        enqueue({
+            "type": "reconnect_ok",
+            "seq": room.seq,
+            "ops_since": {"from_seq": result["from_seq"], "ops": result["ops"]},
+            "participants": participants,
+        })
+
+    with room.lock:
+        room.broadcast({"type": "user_reconnected", "username": username}, exclude=username)
+        room.broadcast({"type": "participant_list", "users": room.participant_list()}, exclude=username)
+    # Also send participant_list to the reconnected client.
+    enqueue({"type": "participant_list", "users": participants})
+    log.info("%s reconnected to room %s", username, room.code)
 
 
 def _handle_leave(state, rm, log) -> None:

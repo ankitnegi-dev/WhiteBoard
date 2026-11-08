@@ -43,6 +43,7 @@ class Participant:
     online: bool = True
     token: str = ""
     kicked: bool = False
+    disconnected_at: Optional[float] = None
     state: Optional[dict[str, Any]] = None
     send: Optional[Callable[[dict[str, Any]], None]] = None
     kick: Optional[Callable[[], None]] = None
@@ -69,6 +70,8 @@ class Room:
         self.undo_stacks: Dict[str, list[dict[str, Any]]] = {}
         self.redo_stacks: Dict[str, list[dict[str, Any]]] = {}
         self.dirty: bool = False
+        self.empty_since: Optional[float] = None
+        self.kicked_tokens: set[str] = set()
 
     def has_password(self) -> bool:
         return self.password_hash is not None
@@ -246,6 +249,7 @@ class Room:
             if isinstance(op_id, str):
                 self.seen_op_ids.add(op_id)
             self.op_log.append(op)
+            self.dirty = True
             # Attach seq to the object for snapshots.
             if mtype in ("stroke_start", "stroke_points", "stroke_end"):
                 obj = self.objects.get(msg.get("stroke_id"))
@@ -263,6 +267,7 @@ class Room:
             ts = time.time()
             entry = {"user": username, "text": text, "timestamp": ts, "seq_chat": self.chat_seq}
             self.chat.append(entry)
+            self.dirty = True
             return True, entry, ""
 
     # ------------------------------------------------------------------ #

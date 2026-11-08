@@ -95,6 +95,15 @@ class WhiteboardApp:
         self.username: str = ""
         self.room_code: str = ""
         self.role: str = "editor"
+        self.token: str = ""
+        self._connect_params: Optional[dict[str, Any]] = None
+
+        # Reconnection state.
+        self._reconnecting: bool = False
+        self._reconnect_backoff: float = 1.0
+        self._reconnect_after_id: Optional[str] = None
+        self._pending_ops: dict[str, dict[str, Any]] = {}
+        self._sync_state: str = "synced"
 
         # Drawing state.
         self.tool = "pen"
@@ -229,6 +238,10 @@ class WhiteboardApp:
             self.connect_status.config(text="Room code is required to join.")
             return
 
+        self._connect_params = {
+            "mode": mode, "host": host, "port": port,
+            "username": username, "room_code": room_code, "password": password,
+        }
         self.connect_status.config(text="Connecting...")
         self.root.update_idletasks()
 
@@ -264,12 +277,14 @@ class WhiteboardApp:
 
         self.net = net
         self.username = username
+        self.token = resp.get("token", self.token)
         self.theme_name = "light"
         self.theme = LIGHT
 
         if mtype == "room_created":
             self.room_code = resp["room_code"]
             self.role = resp.get("role", "host")
+            self.token = resp.get("token", self.token)
             # Host color: look it up once participants arrive; default accent.
             self.user_color = "#1E5B6B"
         elif mtype == "join_ok":
@@ -279,6 +294,7 @@ class WhiteboardApp:
                 self.room_code = self.entry_room_code.get().strip().upper()
             self.role = resp.get("role", "editor")
             self.user_color = resp.get("user_color", self.user_color)
+            self.token = resp.get("token", self.token)
             if not self.user_color and isinstance(resp.get("participants"), list):
                 for u in resp["participants"]:
                     if u.get("name") == self.username:
@@ -304,11 +320,145 @@ class WhiteboardApp:
         self.root.after(10, self._poll)
 
     # ------------------------------------------------------------------ #
+    # Reconnection
+    # ------------------------------------------------------------------ #
+    def _begin_reconnect(self) -> None:
+        self._reconnecting = True
+        self._reconnect_backoff = 1.0
+        # End any incomplete stroke cleanly.
+        for sid, info in list(self.local_strokes.items()):
+            if info.get("batch"):
+                op_id = str(uuid.uuid4())
+                msg = {"type": "stroke_points", "op_id": op_id, "stroke_id": sid,
+                       "points": [list(p) for p in info["batch"]]}
+                self.state.track_pending(op_id)
+                self._pending_ops[op_id] = msg
+                info["batch"] = []
+            if sid in self.state.objects:
+                self.state.objects[sid]["ended"] = True
+            op_id = str(uuid.uuid4())
+            msg = {"type": "stroke_end", "op_id": op_id, "stroke_id": sid}
+            self.state.track_pending(op_id)
+            self._pending_ops[op_id] = msg
+        self.local_strokes.clear()
+        if self.reconnect_banner is not None:
+            self.reconnect_banner.config(text="Reconnecting...")
+            self.reconnect_banner.pack(side="top", fill="x")
+        self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        if self._reconnect_after_id is not None:
+            try:
+                self.root.after_cancel(self._reconnect_after_id)
+            except Exception:
+                pass
+        delay_ms = int(self._reconnect_backoff * 1000)
+        self._reconnect_after_id = self.root.after(delay_ms, self._reconnect_step)
+
+    def _reconnect_step(self) -> None:
+        self._reconnect_after_id = None
+        if not self._reconnecting or self._connect_params is None:
+            return
+        params = self._connect_params
+        threading.Thread(target=self._reconnect_worker, args=(params,), daemon=True).start()
+
+    def _reconnect_worker(self, params: dict[str, Any]) -> None:
+        try:
+            net = NetworkClient(params["host"], params["port"])
+            net.connect()
+            last_seq = self.state.applied_seq
+            net.send({"type": "reconnect", "token": self.token,
+                      "room_code": self.room_code, "last_seq": last_seq})
+            resp = net.wait_for({"reconnect_ok", "reconnect_denied", "_disconnected", "error"}, timeout=6.0)
+            if resp is None:
+                net.disconnect()
+                self.root.after(0, self._reconnect_failed, "No response from server.")
+                return
+            self.root.after(0, self._handle_reconnect_result, net, resp)
+        except Exception as exc:
+            self.root.after(0, self._reconnect_failed, str(exc))
+
+    def _reconnect_failed(self, message: str) -> None:
+        if not self._reconnecting:
+            return
+        self._reconnect_backoff = min(self._reconnect_backoff * 2, 10.0)
+        self._schedule_reconnect()
+
+    def _handle_reconnect_result(self, net: NetworkClient, resp: dict[str, Any]) -> None:
+        mtype = resp.get("type")
+        if mtype in ("reconnect_denied", "error", "_disconnected"):
+            net.disconnect()
+            reason = resp.get("message") or resp.get("reason") or "denied"
+            self._return_to_connect(f"Reconnection denied: {reason}")
+            return
+        if mtype != "reconnect_ok":
+            net.disconnect()
+            self._reconnect_failed("Unexpected response.")
+            return
+
+        self.net = net
+        # Apply state.
+        if isinstance(resp.get("snapshot"), dict):
+            self.state.apply_snapshot(resp["snapshot"])
+            if isinstance(resp.get("chat_history"), list):
+                self.state.apply_chat_history(resp["chat_history"])
+        elif isinstance(resp.get("ops_since"), dict):
+            osi = resp["ops_since"]
+            ops = osi.get("ops", [])
+            if isinstance(ops, list):
+                self.state.apply_ops_since(int(osi.get("from_seq", self.state.applied_seq)), ops)
+        if isinstance(resp.get("seq"), int) and not isinstance(resp.get("seq"), bool):
+            if resp["seq"] > self.state.applied_seq:
+                self.state.applied_seq = resp["seq"]
+        if isinstance(resp.get("participants"), list):
+            self.state.update_participants(resp["participants"])
+            for u in resp["participants"]:
+                if u.get("name") == self.username and u.get("color"):
+                    self.user_color = u.get("color")
+        # Resend pending ops.
+        for op_id, msg in list(self._pending_ops.items()):
+            self.net.send(msg)
+        # Redraw.
+        self._redraw_all()
+        if self.reconnect_banner is not None:
+            self.reconnect_banner.pack_forget()
+        self._reconnecting = False
+        self._reconnect_backoff = 1.0
+        self._sync_state = "synced"
+        self.root.after(10, self._poll)
+
+    def _return_to_connect(self, message: str) -> None:
+        self._reconnecting = False
+        if self.net is not None:
+            try:
+                self.net.disconnect()
+            except Exception:
+                pass
+            self.net = None
+        if hasattr(self, "main_frame"):
+            try:
+                self.main_frame.destroy()
+            except Exception:
+                pass
+        self.state = BoardState()
+        self.local_strokes.clear()
+        self._pending_ops.clear()
+        self.token = ""
+        self._show_connect()
+        self.connect_status.config(text=message)
+
+    # ------------------------------------------------------------------ #
     # Main window
     # ------------------------------------------------------------------ #
     def _build_main(self) -> None:
         self.main_frame = ttk.Frame(self.root)
         self.main_frame.pack(fill="both", expand=True)
+
+        self.reconnect_banner = ttk.Label(self.main_frame, text="", anchor="center",
+                                         background="#E8B923", foreground="#102022",
+                                         font=("Segoe UI", 11, "bold"))
+        self.reconnect_banner.pack(side="top", fill="x")
+        self.reconnect_banner.pack_forget()
 
         # Left toolbar.
         self.toolbar = ttk.Frame(self.main_frame, width=72, padding=8)
@@ -454,6 +604,8 @@ class WhiteboardApp:
         self.status_latency.pack(side="right", padx=4)
         self.status_seq = ttk.Label(self.status_bar, text="seq: 0", width=10, anchor="e")
         self.status_seq.pack(side="right", padx=4)
+        self.status_sync = ttk.Label(self.status_bar, text="synced", width=10, anchor="e")
+        self.status_sync.pack(side="right", padx=4)
 
         # Keyboard shortcuts (Control and Command).
         for mod in ("<Control-", "<Command-"):
@@ -784,6 +936,9 @@ class WhiteboardApp:
     # Drawing input
     # ------------------------------------------------------------------ #
     def _on_press(self, event):
+        if self._reconnecting:
+            self._toast("Reconnecting...")
+            return
         # Ignore presses in the letterbox/surround; only the paper is
         # drawable.  Using the shared transform keeps this consistent with
         # the pen and eraser hit-tests.
@@ -826,11 +981,13 @@ class WhiteboardApp:
                 "seq": 0,
             }
             self.state.track_pending(op_id)
+            msg = {"type": "stroke_start", "op_id": op_id, "stroke_id": sid,
+                   "tool": "pen", "color": self.color, "width": self.width,
+                   "x": lx, "y": ly}
+            self._pending_ops[op_id] = msg
             self.state.start_drawing(self.username)
             if self.net:
-                self.net.send({"type": "stroke_start", "op_id": op_id, "stroke_id": sid,
-                               "tool": "pen", "color": self.color, "width": self.width,
-                               "x": lx, "y": ly})
+                self.net.send(msg)
         elif self.tool == "eraser":
             self._erase_at(lx, ly)
 
@@ -882,8 +1039,10 @@ class WhiteboardApp:
                  max(0.0, min(float(LOGICAL_HEIGHT), float(p[1])))] for p in points]
         op_id = str(uuid.uuid4())
         self.state.track_pending(op_id)
-        self.net.send({"type": "stroke_points", "op_id": op_id,
-                       "stroke_id": sid, "points": safe})
+        msg = {"type": "stroke_points", "op_id": op_id,
+               "stroke_id": sid, "points": safe}
+        self._pending_ops[op_id] = msg
+        self.net.send(msg)
 
     def _erase_at(self, lx: float, ly: float) -> None:
         sid = find_stroke_at(self.state.objects, lx, ly, threshold=self._erase_threshold())
@@ -897,7 +1056,10 @@ class WhiteboardApp:
             return
         op_id = str(uuid.uuid4())
         self._last_delete = {"op_id": op_id, "target_id": sid}
-        self.net.send({"type": "delete_object", "op_id": op_id, "target_id": sid})
+        msg = {"type": "delete_object", "op_id": op_id, "target_id": sid}
+        self._pending_ops[op_id] = msg
+        self.state.track_pending(op_id)
+        self.net.send(msg)
         logging.getLogger("whiteboard.ui").debug("sent delete_object op=%s target=%s", op_id, sid)
         self._last_erased = sid
 
@@ -928,7 +1090,9 @@ class WhiteboardApp:
         if self.net:
             op_id = str(uuid.uuid4())
             self.state.track_pending(op_id)
-            self.net.send({"type": "stroke_end", "op_id": op_id, "stroke_id": sid})
+            msg = {"type": "stroke_end", "op_id": op_id, "stroke_id": sid}
+            self._pending_ops[op_id] = msg
+            self.net.send(msg)
         self.state.end_drawing(self.username)
 
     def _on_hover(self, event):
@@ -948,6 +1112,8 @@ class WhiteboardApp:
     # ------------------------------------------------------------------ #
     def _poll(self) -> None:
         if self.net is None:
+            if self._reconnecting:
+                self.root.after(100, self._poll)
             return
         try:
             try:
@@ -994,6 +1160,8 @@ class WhiteboardApp:
         mtype = msg.get("type")
         if mtype == "_disconnected":
             self.status_conn.config(text=f"Disconnected: {msg.get('reason')}")
+            if not self._reconnecting:
+                self._begin_reconnect()
             return
         if mtype == "participant_list":
             users = msg.get("users", [])
@@ -1033,6 +1201,7 @@ class WhiteboardApp:
             op_id = msg.get("op_id")
             if self.state.is_pending(op_id):
                 self.state.clear_pending(op_id)
+                self._pending_ops.pop(op_id, None)
                 # Already rendered locally; just track seq.
                 seq = msg.get("seq")
                 if isinstance(seq, int) and not isinstance(seq, bool):
@@ -1041,6 +1210,7 @@ class WhiteboardApp:
                 return
             status = self.state.apply_op(msg)
             if status == "gap":
+                self._sync_state = "syncing"
                 if self.net:
                     self.net.send({"type": "resync_request", "last_seq": self.state.applied_seq})
                 return
@@ -1059,14 +1229,24 @@ class WhiteboardApp:
             return
         if mtype == "snapshot":
             self.state.apply_snapshot(msg)
+            self._sync_state = "synced"
             self._redraw_all()
             return
         if mtype == "ops_since":
             ops = msg.get("ops", [])
             if isinstance(ops, list):
                 self.state.apply_ops_since(int(msg.get("from_seq", self.state.applied_seq)), ops)
+                self._sync_state = "synced"
                 # Redraw to be safe.
                 self._redraw_all()
+            return
+        if mtype == "reconnect_ok":
+            self._handle_reconnect_ok(msg)
+            return
+        if mtype == "reconnect_denied":
+            reason = msg.get("reason") or "denied"
+            message = msg.get("message") or reason
+            self._return_to_connect(f"Reconnection denied: {message}")
             return
         if mtype == "join_ok":
             # Late-arriving join confirmation (should already be handled).
@@ -1526,6 +1706,11 @@ class WhiteboardApp:
         if getattr(self, "_last_seq_text", None) != seq_text:
             self._last_seq_text = seq_text
             self.status_seq.config(text=seq_text)
+        sync_text = getattr(self, "_sync_state", "synced")
+        if getattr(self, "_last_sync_text", None) != sync_text:
+            self._last_sync_text = sync_text
+            if hasattr(self, "status_sync"):
+                self.status_sync.config(text=sync_text)
 
 
 class Tooltip:

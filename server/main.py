@@ -23,7 +23,9 @@ import sys as _sys
 _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import platform_utils
-from server.client_handler import handle_client
+from server.client_handler import handle_client, monitor_clients
+from server.room_manager import RoomManager
+from server import persistence
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -38,6 +40,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--heartbeat-interval", type=float, default=5.0, help="seconds between server pings")
     parser.add_argument("--heartbeat-timeout", type=float, default=15.0, help="seconds of silence before disconnect")
+    parser.add_argument("--rooms-dir", default="rooms", help="directory for saved rooms (default rooms)")
+    parser.add_argument("--grace-period", type=float, default=120.0, help="seconds an offline user keeps their slot")
+    parser.add_argument("--empty-room-grace", type=float, default=5.0, help="seconds before an empty room is removed")
+    parser.add_argument("--autosave-interval", type=float, default=30.0, help="seconds between autosave scans")
+    parser.add_argument("--rate-limit", type=float, default=60.0, help="max ops per second per client")
     return parser.parse_args(argv)
 
 
@@ -50,11 +57,7 @@ def setup_logging(level: str) -> None:
 
 
 def make_server_socket(host: str, port: int) -> socket.socket:
-    """Create and bind the listening socket.
-
-    SO_REUSEADDR lets us restart quickly after a crash or Ctrl+C without
-    waiting for the OS to release the port (TIME_WAIT).
-    """
+    """Create and bind the listening socket."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, port))
@@ -66,6 +69,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     setup_logging(args.log_level)
     log = logging.getLogger("server.main")
+
+    persistence.set_rooms_dir(args.rooms_dir)
+
+    rm = RoomManager(grace_period=args.grace_period,
+                     empty_room_grace=args.empty_room_grace)
 
     sock = make_server_socket(args.host, args.port)
     log.info("server listening on %s:%d", args.host, args.port)
@@ -81,13 +89,29 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.info("shutdown requested")
         stop_event.set()
 
-    # SIGINT works on both Windows and Linux for Ctrl+C. SIGTERM is the
-    # normal Unix service-manager signal; Windows ignores it, which is fine.
     signal.signal(signal.SIGINT, _request_stop)
     try:
         signal.signal(signal.SIGTERM, _request_stop)
     except (AttributeError, ValueError):
         pass
+
+    # Single monitor thread for all clients.
+    monitor_thread = threading.Thread(
+        target=monitor_clients,
+        args=(args.heartbeat_interval, args.heartbeat_timeout, stop_event),
+        name="client-monitor",
+        daemon=True,
+    )
+    monitor_thread.start()
+
+    # Autosave thread: saves dirty rooms and prunes empty rooms.
+    autosave_thread = threading.Thread(
+        target=persistence.autosave_loop,
+        args=(rm, args.autosave_interval, stop_event, args.empty_room_grace, args.grace_period),
+        name="autosave",
+        daemon=True,
+    )
+    autosave_thread.start()
 
     try:
         while not stop_event.is_set():
@@ -103,17 +127,28 @@ def main(argv: Optional[list[str]] = None) -> int:
             log.info("client connected from %s:%d", addr[0], addr[1])
             thread = threading.Thread(
                 target=handle_client,
-                args=(conn, addr, log, args.heartbeat_interval, args.heartbeat_timeout),
+                args=(conn, addr, log, args.heartbeat_interval, args.heartbeat_timeout, rm, args.rate_limit),
                 name=f"client-{addr[0]}:{addr[1]}",
                 daemon=True,
             )
             thread.start()
     finally:
-        log.info("shutting down, closing listening socket")
+        log.info("shutting down, saving rooms")
+        stop_event.set()
+        # Save all rooms on shutdown.
+        for code in rm.codes():
+            room = rm.get(code)
+            if room is not None:
+                try:
+                    persistence.save_room(room)
+                except Exception:
+                    pass
         try:
             sock.close()
         except OSError:
             pass
+        monitor_thread.join(timeout=2.0)
+        autosave_thread.join(timeout=2.0)
     return 0
 
 
