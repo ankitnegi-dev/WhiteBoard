@@ -11,47 +11,6 @@ import time
 from typing import Any, Optional
 
 
-LOGICAL_WIDTH = 1600
-LOGICAL_HEIGHT = 900
-
-
-def canvas_to_logical(cx: float, cy: float, canvas_w: int, canvas_h: int,
-                      offset_x: float = 0.0, offset_y: float = 0.0,
-                      scale: float = 1.0) -> tuple[float, float]:
-    """Map a canvas pixel coordinate back to logical board coordinates.
-
-    The canvas keeps the 16:9 aspect ratio, so there may be letterboxing.
-    ``offset_x/offset_y`` is the top-left of the drawn area and ``scale``
-    is pixels per logical unit.
-    """
-    if scale <= 0:
-        scale = 1.0
-    lx = (cx - offset_x) / scale
-    ly = (cy - offset_y) / scale
-    # Clamp to the logical canvas so a drag that leaves the board does not
-    # produce out-of-range coordinates the server would reject.
-    lx = max(0.0, min(LOGICAL_WIDTH, lx))
-    ly = max(0.0, min(LOGICAL_HEIGHT, ly))
-    return lx, ly
-
-
-def logical_to_canvas(lx: float, ly: float, offset_x: float = 0.0,
-                      offset_y: float = 0.0, scale: float = 1.0) -> tuple[float, float]:
-    return (lx * scale + offset_x, ly * scale + offset_y)
-
-
-def compute_scale(canvas_w: int, canvas_h: int) -> tuple[float, float, float]:
-    """Return (scale, offset_x, offset_y) for a 16:9 fit inside the canvas."""
-    if canvas_w <= 0 or canvas_h <= 0:
-        return 1.0, 0.0, 0.0
-    scale = min(canvas_w / LOGICAL_WIDTH, canvas_h / LOGICAL_HEIGHT)
-    drawn_w = LOGICAL_WIDTH * scale
-    drawn_h = LOGICAL_HEIGHT * scale
-    offset_x = (canvas_w - drawn_w) / 2.0
-    offset_y = (canvas_h - drawn_h) / 2.0
-    return scale, offset_x, offset_y
-
-
 class BoardState:
     def __init__(self) -> None:
         self.objects: dict[str, dict[str, Any]] = {}   # stroke_id -> object
@@ -190,34 +149,6 @@ class BoardState:
         elif mtype == "clear_canvas":
             self.objects.clear()
             self.clear_drawers()
-        elif mtype == "undo":
-            action = op.get("action")
-            if action == "remove_stroke":
-                tid = op.get("target_id")
-                if isinstance(tid, str):
-                    self.objects.pop(tid, None)
-            elif action == "restore_object":
-                obj = op.get("object")
-                if isinstance(obj, dict) and "id" in obj:
-                    self.objects[obj["id"]] = dict(obj)
-            elif action == "restore_objects":
-                for obj in op.get("objects", []):
-                    if isinstance(obj, dict) and "id" in obj:
-                        self.objects[obj["id"]] = dict(obj)
-        elif mtype == "redo":
-            action = op.get("action")
-            if action == "add_stroke":
-                obj = op.get("object")
-                if isinstance(obj, dict) and "id" in obj:
-                    self.objects[obj["id"]] = dict(obj)
-            elif action == "remove_stroke":
-                tid = op.get("target_id")
-                if isinstance(tid, str):
-                    self.objects.pop(tid, None)
-            elif action == "remove_objects":
-                for tid in op.get("target_ids", []):
-                    if isinstance(tid, str):
-                        self.objects.pop(tid, None)
         elif mtype == "undo":
             action = op.get("action")
             if action == "remove_stroke":

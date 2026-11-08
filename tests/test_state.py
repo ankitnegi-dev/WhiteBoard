@@ -2,21 +2,17 @@
 
 from __future__ import annotations
 
-from client.state import (
-    BoardState,
-    canvas_to_logical,
-    compute_scale,
-    logical_to_canvas,
-)
+from client.state import BoardState
+from client.tools import board_rect, canvas_transform, logical_to_window, window_to_logical
 
 
 def test_compute_scale_letterboxes():
-    scale, ox, oy = compute_scale(1600, 900)
+    scale, ox, oy = canvas_transform(1600, 900)
     assert scale == 1.0
     assert ox == 0.0
     assert oy == 0.0
 
-    scale2, ox2, oy2 = compute_scale(800, 600)
+    scale2, ox2, oy2 = canvas_transform(800, 600)
     # 16:9 into 800x600 -> width limited, letterboxed top and bottom.
     assert abs(scale2 - 0.5) < 1e-9
     assert ox2 == 0
@@ -24,25 +20,31 @@ def test_compute_scale_letterboxes():
 
 
 def test_canvas_to_logical_round_trip():
-    scale, ox, oy = compute_scale(1600, 900)
-    cx, cy = logical_to_canvas(100, 200, ox, oy, scale)
-    lx, ly = canvas_to_logical(cx, cy, 1600, 900, ox, oy, scale)
+    cx, cy = logical_to_window(100, 200, 1600, 900)
+    lx, ly = window_to_logical(cx, cy, 1600, 900)
     assert abs(lx - 100) < 1e-6
     assert abs(ly - 200) < 1e-6
 
 
 def test_canvas_to_logical_clamps():
-    scale, ox, oy = compute_scale(1600, 900)
-    lx, ly = canvas_to_logical(-5, 10000, 1600, 900, ox, oy, scale)
+    lx, ly = window_to_logical(-5, 10000, 1600, 900)
     assert lx == 0.0
     assert ly == 900.0
 
+
 def test_board_bounds_clamp():
-    scale, ox, oy = compute_scale(1600, 900)
     # Outside left/top clamps to 0.
-    assert canvas_to_logical(-10, -10, 1600, 900, ox, oy, scale) == (0.0, 0.0)
+    assert window_to_logical(-10, -10, 1600, 900) == (0.0, 0.0)
     # Outside right/bottom clamps to max.
-    assert canvas_to_logical(2000, 1000, 1600, 900, ox, oy, scale) == (1600.0, 900.0)
+    assert window_to_logical(2000, 1000, 1600, 900) == (1600.0, 900.0)
+
+
+def test_board_rect_matches_letterbox():
+    x0, y0, x1, y1 = board_rect(800, 600)
+    assert x0 == 0.0
+    assert y0 == 75.0
+    assert x1 == 800.0
+    assert y1 == 525.0
 
 
 def test_gap_detection_and_duplicate():

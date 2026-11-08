@@ -15,9 +15,14 @@ Light theme (default):
 - ink_muted: #6B7280
 - accent: #1E5B6B (deep teal ink, used for primary actions)
 - accent_hover: #174A57
+- on_accent: #FFFFFF (text and icons on accent)
 - highlight: #E8B923 (yellow marker, used for selection and focus)
 - danger: #B83A2E
 - border: #D6D0C4
+- canvas: #DCD3C1 (surround outside the paper)
+- paper: #FBF8F1 (the drawable board, always light)
+- paper_border: #8A7F68
+- board_accent: #1E5B6B (eraser hover, readable on paper)
 
 Dark theme:
 
@@ -28,9 +33,18 @@ Dark theme:
 - ink_muted: #9CA3AF
 - accent: #5FA8A8
 - accent_hover: #72B8B8
+- on_accent: #102022 (dark text on the light teal accent)
 - highlight: #D6A84F
 - danger: #D06050
 - border: #3A4048
+- canvas: #12161A
+- paper: #FBF8F1
+- paper_border: #8A7F68
+- board_accent: #1E5B6B
+
+The board is light paper in both themes. Only the surround and chrome
+change, so ink, user stroke colors, and screenshots stay readable when the
+dark theme is active.
 
 Per-user colors are assigned by the server from USER_COLORS in
 server/room.py. They are used for strokes, cursor markers, and the
@@ -70,8 +84,9 @@ Canvas outer padding is 12.
 - Window minimum: 1100 x 700.
 - Left rail: 72 px wide, icon + label toolbar, vertical.
 - Center: canvas fills remaining space, keeps 16:9 logical aspect.
-- Right rail: 280 px wide, split between participants (top) and chat (bottom).
-- Status bar: 24 px high, single line.
+- Right rail: 320 px fixed width, split between participants (top) and chat
+  (bottom). pack_propagate is disabled so content never resizes the rail.
+- Status bar: 24 px high, single line, fixed character widths per label.
 
 ASCII wireframe:
 
@@ -87,32 +102,58 @@ Alignment is left for text, center for the canvas, right for status numbers.
 
 ## 5. Component styles (ttk, "clam" base)
 
-- Buttons: flat, 6 px radius via clam, accent background, white text, 8 px
-  horizontal padding, 4 px vertical. Hover darkens accent by 10 percent.
-- Toolbar buttons: 56 x 56, icon above label, selected state uses highlight
-  background with ink text.
+- Buttons: flat 1 px outline, accent background, on_accent text, 8 px
+  horizontal padding, 4 px vertical. Hover darkens or lightens accent.
+- Disabled buttons: surface_alt background and ink_muted text, always at
+  least 3:1 contrast, never hidden. Tooltips say "Host only" or
+  "Viewers cannot do this" as appropriate.
+- Toolbar buttons: flat outline, surface background, ink text. The selected
+  tool uses accent background with on_accent text and is visibly different
+  in both themes.
 - Panels: surface background, 1 px border in border color, 12 px padding.
 - List rows: 28 px high, hover uses surface_alt, selected uses accent with
-  white text.
+  on_accent text. Each row reserves a fixed drawing-indicator slot.
 - Chat message: name in bold user color, timestamp in muted small, body in
-  ink with a 4 px left indent.
-- Inputs: surface background, 1 px border, 4 px padding, focus ring in
-  highlight color (2 px).
-- Canvas: bg color from theme, no border, crosshair cursor while drawing.
+  the theme ink color, so the body remains visible after a theme switch.
+- Inputs and dropdowns: surface background, 1 px border, ink text, focus
+  ring in highlight color (2 px). Dropdown lists use surface and on_accent
+  selection colors.
+- Canvas: the widget background is the theme surround; a light paper
+  rectangle is drawn inside it with a 2 px paper_border outline. Drawing is
+  clamped to the paper and a matte hides anything outside it.
 
 ## 6. Motion
 
 Only action-driven motion: selection highlight, button press. No entrance
 animations. Cursor markers fade in over 80 ms when a new user appears.
 
-## 7. Accessibility
+## 7. Coordinate transform
+
+All pixel to logical conversions go through client/tools.py:
+canvas_transform, window_to_logical, logical_to_window, is_inside_board,
+and board_rect. There is exactly one copy of the scale and letterbox math.
+
+- The widget border and highlight thickness are passed as the inset.
+- canvasx and canvasy are used before the transform for scroll safety.
+- The pen press point, the eraser hit-test, remote cursor markers, the board
+  background, and the debug overlay all use this same pair of functions.
+- Presses outside the paper are ignored. Motion and release points are
+  clamped to 0..1600 by 0..900 before they are drawn or sent.
+
+Ctrl+Shift+D toggles a debug overlay showing the raw event pixel, canvas
+pixel, logical coordinate, board rectangle, scale, offset, and inset.
+
+## 8. Accessibility
 
 - Visible focus ring on every interactive widget.
-- Contrast: ink on bg must be at least 4.5:1 in both themes.
+- Contrast: text and icon pairs are at least 3:1 in both themes, including
+  disabled button text. Body text targets 4.5:1 or better.
+- Disabled actions stay visible and explain their restriction in a tooltip.
 - All actions reachable by keyboard; shortcuts use Control on Windows/Linux
   and Command on macOS.
 
-## 8. Theme toggle
+## 9. Theme toggle
 
-A single button in the toolbar switches light/dark. The choice is stored
-in memory only for Day 3; persistence comes later.
+A single button in the toolbar switches light/dark. The board remains light
+paper in both themes. The choice is stored in memory only; persistence comes
+later.

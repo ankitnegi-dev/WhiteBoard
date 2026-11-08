@@ -22,8 +22,17 @@ except ImportError:  # pragma: no cover - handled in main.py
     raise
 
 from client.net import NetworkClient
-from client.state import BoardState, canvas_to_logical, compute_scale, logical_to_canvas
-from client.tools import find_stroke_at
+from client.state import BoardState
+from client.tools import (
+    LOGICAL_HEIGHT,
+    LOGICAL_WIDTH,
+    board_rect,
+    canvas_transform,
+    find_stroke_at,
+    is_inside_board,
+    logical_to_window,
+    window_to_logical,
+)
 
 # --------------------------------------------------------------------------- #
 # Theme palettes (see docs/design-system.md)
@@ -37,10 +46,16 @@ LIGHT = {
     "ink_muted": "#6B7280",
     "accent": "#1E5B6B",
     "accent_hover": "#174A57",
+    "on_accent": "#FFFFFF",
     "highlight": "#E8B923",
     "danger": "#B83A2E",
     "border": "#D6D0C4",
-    "canvas": "#FBF8F1",
+    "canvas": "#DCD3C1",
+    # The board itself is always light paper so ink stays readable even
+    # when the surrounding chrome switches to the dark theme.
+    "paper": "#FBF8F1",
+    "paper_border": "#8A7F68",
+    "board_accent": "#1E5B6B",
 }
 
 DARK = {
@@ -51,10 +66,14 @@ DARK = {
     "ink_muted": "#9CA3AF",
     "accent": "#5FA8A8",
     "accent_hover": "#72B8B8",
+    "on_accent": "#102022",
     "highlight": "#D6A84F",
     "danger": "#D06050",
     "border": "#3A4048",
-    "canvas": "#1F2329",
+    "canvas": "#12161A",
+    "paper": "#FBF8F1",
+    "paper_border": "#8A7F68",
+    "board_accent": "#1E5B6B",
 }
 
 USER_COLORS_FALLBACK = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4"]
@@ -89,6 +108,8 @@ class WhiteboardApp:
         self._blink = False
         self._last_ping_time = 0.0
         self._ping_ts = 0.0
+        self.debug_overlay = False
+        self.debug_label = None
 
         # Scaling state for the logical 1600x900 canvas.
         self.scale = 1.0
@@ -317,14 +338,21 @@ class WhiteboardApp:
         self._update_width_preview()
 
         ttk.Separator(self.toolbar, orient="horizontal").pack(fill="x", pady=8)
-        ttk.Button(self.toolbar, text="Undo", command=self._undo).pack(fill="x", pady=2)
-        ttk.Button(self.toolbar, text="Redo", command=self._redo).pack(fill="x", pady=2)
+        self.undo_btn = ttk.Button(self.toolbar, text="Undo", command=self._undo)
+        self.undo_btn.pack(fill="x", pady=2)
+        Tooltip(self.undo_btn, "Undo your last action")
+        self.redo_btn = ttk.Button(self.toolbar, text="Redo", command=self._redo)
+        self.redo_btn.pack(fill="x", pady=2)
+        Tooltip(self.redo_btn, "Redo your last action")
         self.clear_btn = ttk.Button(self.toolbar, text="Clear", command=self._clear_canvas)
         self.clear_btn.pack(fill="x", pady=2)
+        Tooltip(self.clear_btn, "Host only")
         self.save_btn = ttk.Button(self.toolbar, text="Save", command=self._save_board)
         self.save_btn.pack(fill="x", pady=2)
+        Tooltip(self.save_btn, "Host only")
         self.load_btn = ttk.Button(self.toolbar, text="Load", command=self._load_board)
         self.load_btn.pack(fill="x", pady=2)
+        Tooltip(self.load_btn, "Host only")
 
         if self.role != "host":
             self.clear_btn.state(["disabled"])
@@ -335,10 +363,14 @@ class WhiteboardApp:
         self.theme_btn = ttk.Button(self.toolbar, text="Theme", command=self._toggle_theme)
         self.theme_btn.pack(fill="x", pady=4)
 
-        # Center canvas.
+        # Center canvas.  The pack padding is outside the widget, so event
+        # coordinates never include it; only the widget border and highlight
+        # ring are part of the coordinate transform.  Both are explicitly
+        # zero here, which makes the mapping stable across Tk platforms.
         canvas_frame = ttk.Frame(self.main_frame)
         canvas_frame.pack(side="left", fill="both", expand=True)
-        self.canvas = tk.Canvas(canvas_frame, bg=self.theme["canvas"], highlightthickness=0)
+        self.canvas = tk.Canvas(canvas_frame, bg=self.theme["canvas"],
+                                borderwidth=0, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=12, pady=12)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<Button-1>", self._on_press)
@@ -346,8 +378,9 @@ class WhiteboardApp:
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Motion>", self._on_hover)
 
-        # Right panel.
-        self.right = ttk.Frame(self.main_frame, width=280, padding=8)
+        # Right panel.  A fixed width is what stops chat/participant content
+        # from resizing the whole rail while someone is drawing.
+        self.right = ttk.Frame(self.main_frame, width=320, padding=8)
         self.right.pack(side="right", fill="y")
         self.right.pack_propagate(False)
 
@@ -391,32 +424,35 @@ class WhiteboardApp:
             hc = ttk.Frame(self.right)
             hc.pack(fill="x", pady=4)
             ttk.Label(hc, text="Target").grid(row=0, column=0, sticky="w")
-            self.host_target = ttk.Combobox(hc, values=[], width=12)
+            self.host_target = ttk.Combobox(hc, values=[], width=12, state="readonly")
             self.host_target.grid(row=0, column=1, padx=4)
             self.host_target.bind("<<ComboboxSelected>>", lambda _e: self._update_host_buttons())
             ttk.Label(hc, text="Role").grid(row=1, column=0, sticky="w")
-            self.host_role = ttk.Combobox(hc, values=["editor", "viewer"], width=12)
+            self.host_role = ttk.Combobox(hc, values=["editor", "viewer"], width=12, state="readonly")
             self.host_role.set("editor")
             self.host_role.grid(row=1, column=1, padx=4)
             self.apply_role_btn = ttk.Button(hc, text="Apply role", command=self._apply_role)
             self.apply_role_btn.grid(row=2, column=0, columnspan=2, pady=4, sticky="ew")
+            Tooltip(self.apply_role_btn, "Host only")
             self.kick_btn = ttk.Button(hc, text="Kick", command=self._kick_user)
             self.kick_btn.grid(row=3, column=0, columnspan=2, pady=4, sticky="ew")
+            Tooltip(self.kick_btn, "Host only")
             self.apply_role_btn.state(["disabled"])
             self.kick_btn.state(["disabled"])
             self.lock_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(hc, text="Lock room", variable=self.lock_var, command=self._toggle_lock).grid(row=4, column=0, columnspan=2, sticky="w")
 
-        # Status bar.
+        # Status bar.  Fixed character widths keep changing values (latency,
+        # seq, activity) from shoving the neighbouring labels around.
         self.status_bar = ttk.Frame(self.root, padding=(8, 2))
         self.status_bar.pack(side="bottom", fill="x")
-        self.status_conn = ttk.Label(self.status_bar, text="Connecting")
+        self.status_conn = ttk.Label(self.status_bar, text="Connecting", width=36, anchor="w")
         self.status_conn.pack(side="left", padx=4)
-        self.status_activity = ttk.Label(self.status_bar, text="")
+        self.status_activity = ttk.Label(self.status_bar, text="", width=36, anchor="w")
         self.status_activity.pack(side="left", padx=12)
-        self.status_latency = ttk.Label(self.status_bar, text="latency: -")
+        self.status_latency = ttk.Label(self.status_bar, text="latency: -", width=16, anchor="e")
         self.status_latency.pack(side="right", padx=4)
-        self.status_seq = ttk.Label(self.status_bar, text="seq: 0")
+        self.status_seq = ttk.Label(self.status_bar, text="seq: 0", width=10, anchor="e")
         self.status_seq.pack(side="right", padx=4)
 
         # Keyboard shortcuts (Control and Command).
@@ -428,6 +464,7 @@ class WhiteboardApp:
             self.root.bind(f"{mod}y>", lambda _e: self._redo())
         self.root.bind("<Control-Shift-Z>", lambda _e: self._redo())
         self.root.bind("<Command-Shift-Z>", lambda _e: self._redo())
+        self.root.bind("<Control-Shift-D>", lambda _e: self._toggle_debug_overlay())
         self.root.bind("<Escape>", lambda _e: self._set_tool("pen"))
 
         # Mouse wheel for width (cross-platform).
@@ -435,18 +472,64 @@ class WhiteboardApp:
         self.canvas.bind("<Button-4>", lambda e: self._adjust_width(1))
         self.canvas.bind("<Button-5>", lambda e: self._adjust_width(-1))
 
+        self._update_permissions()
+
     def _tool_button(self, label, tool):
         btn = ttk.Button(self.toolbar, text=label, command=lambda: self._set_tool(tool), style="Tool.TButton")
         btn.pack(fill="x", pady=4)
         self.tool_buttons[tool] = btn
-        Tooltip(btn, f"Select {label.lower()} tool")
+        self.tool_tooltips = getattr(self, "tool_tooltips", {})
+        self.tool_tooltips[tool] = Tooltip(btn, f"Select {label.lower()} tool")
+
+    def _set_enabled(self, widget, enabled: bool) -> None:
+        if widget is None:
+            return
+        if enabled:
+            widget.state(["!disabled"])
+        else:
+            widget.state(["disabled"])
+
+    def _update_permissions(self) -> None:
+        """Enable only actions the current role is allowed to perform.
+
+        Disabled controls stay visible so users can see the feature exists;
+        their tooltips explain whether the limit is host-only or viewer-only.
+        """
+        is_viewer = self.role == "viewer"
+        is_host = self.role == "host"
+        reason = "Viewers cannot do this" if is_viewer else "Host only"
+        for name in ("undo_btn", "redo_btn"):
+            widget = getattr(self, name, None)
+            self._set_enabled(widget, not is_viewer)
+        for name in ("clear_btn", "save_btn", "load_btn"):
+            widget = getattr(self, name, None)
+            self._set_enabled(widget, is_host)
+        for tool, btn in getattr(self, "tool_buttons", {}).items():
+            self._set_enabled(btn, not is_viewer)
+            tip = getattr(self, "tool_tooltips", {}).get(tool)
+            if tip is not None:
+                tip.set_text(reason if is_viewer else f"Select {tool.lower()} tool")
+        if is_viewer:
+            for name in ("undo_btn", "redo_btn", "clear_btn", "save_btn", "load_btn"):
+                widget = getattr(self, name, None)
+                tip = getattr(widget, "_tooltip", None)
+                if tip is not None:
+                    tip.set_text(reason)
+        else:
+            for name in ("clear_btn", "save_btn", "load_btn"):
+                widget = getattr(self, name, None)
+                tip = getattr(widget, "_tooltip", None)
+                if tip is not None:
+                    tip.set_text("Host only")
+        self._update_host_buttons()
 
     def _set_tool(self, tool):
         self.tool = tool
         self._highlight_erase_target(None)
         for t, btn in self.tool_buttons.items():
             btn.configure(style="ToolActive.TButton" if t == tool else "Tool.TButton")
-        self.status_conn.config(text=f"Tool: {tool}")
+        if hasattr(self, "status_conn"):
+            self.status_conn.config(text=f"Tool: {tool}")
 
     def _pick_color(self):
         res = colorchooser.askcolor(color=self.color, parent=self.root)
@@ -479,7 +562,7 @@ class WhiteboardApp:
         c.configure(bg=self.theme["bg"])
         y = 10
         c.create_oval(4, y - self.width / 2, 4 + self.width, y + self.width / 2,
-                      fill=self.theme["accent"], outline="")
+                      fill=self.theme["accent"], outline=self.theme["ink"], width=1)
 
     def _adjust_width(self, delta):
         self.width = max(1.0, min(20.0, self.width + delta))
@@ -507,70 +590,240 @@ class WhiteboardApp:
         style.configure(".", background=t["bg"], foreground=t["ink"], font=("Segoe UI", 10))
         style.configure("TFrame", background=t["bg"])
         style.configure("TLabel", background=t["bg"], foreground=t["ink"])
-        style.configure("TButton", background=t["accent"], foreground="#FFFFFF", padding=6)
-        style.map("TButton", background=[("active", t["accent_hover"])])
-        style.configure("Tool.TButton", background=t["surface"], foreground=t["ink"], padding=4)
-        style.map("Tool.TButton", background=[("active", t["surface_alt"])])
-        style.configure("ToolActive.TButton", background=t["accent"], foreground="#FFFFFF", padding=4)
-        style.configure("TEntry", fieldbackground=t["surface"], foreground=t["ink"])
-        style.configure("TCombobox", fieldbackground=t["surface"], foreground=t["ink"])
-        style.configure("TScale", background=t["bg"])
+        style.configure("TButton", background=t["accent"], foreground=t["on_accent"],
+                        padding=6, relief="flat", borderwidth=1, bordercolor=t["border"])
+        style.map("TButton",
+                  background=[("pressed", t["accent_hover"]), ("active", t["accent_hover"]),
+                              ("disabled", t["surface_alt"])],
+                  foreground=[("disabled", t["ink_muted"])],
+                  bordercolor=[("disabled", t["border"])])
+        style.configure("Tool.TButton", background=t["surface"], foreground=t["ink"],
+                        padding=4, relief="flat", borderwidth=1, bordercolor=t["border"])
+        style.map("Tool.TButton",
+                  background=[("pressed", t["surface_alt"]), ("active", t["surface_alt"]),
+                              ("disabled", t["surface_alt"])],
+                  foreground=[("disabled", t["ink_muted"])],
+                  bordercolor=[("disabled", t["border"])])
+        style.configure("ToolActive.TButton", background=t["accent"], foreground=t["on_accent"],
+                        padding=4, relief="flat", borderwidth=1, bordercolor=t["accent"])
+        style.map("ToolActive.TButton",
+                  background=[("pressed", t["accent_hover"]), ("active", t["accent_hover"])],
+                  foreground=[("disabled", t["ink_muted"])])
+        style.configure("TEntry", fieldbackground=t["surface"], foreground=t["ink"],
+                        insertcolor=t["ink"], bordercolor=t["border"])
+        style.configure("TCombobox", fieldbackground=t["surface"], foreground=t["ink"],
+                        background=t["surface"], arrowcolor=t["ink"], bordercolor=t["border"])
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", t["surface"]), ("disabled", t["surface_alt"])],
+                  foreground=[("readonly", t["ink"]), ("disabled", t["ink_muted"])],
+                  background=[("readonly", t["surface"])],
+                  arrowcolor=[("readonly", t["ink"]), ("disabled", t["ink_muted"])])
+        style.configure("TCheckbutton", background=t["bg"], foreground=t["ink"])
+        style.map("TCheckbutton", foreground=[("disabled", t["ink_muted"])])
+        style.configure("TScale", background=t["bg"], troughcolor=t["surface_alt"])
+        self.root.option_add("*TCombobox*Listbox.background", t["surface"])
+        self.root.option_add("*TCombobox*Listbox.foreground", t["ink"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", t["accent"])
+        self.root.option_add("*TCombobox*Listbox.selectForeground", t["on_accent"])
         self.root.configure(bg=t["bg"])
-        self.canvas.configure(bg=t["canvas"])
+        if hasattr(self, "canvas"):
+            self.canvas.configure(bg=t["canvas"])
+            self._draw_board_background()
         if hasattr(self, "chat_text"):
-            self.chat_text.configure(bg=t["surface"], fg=t["ink"], insertbackground=t["ink"])
+            self.chat_text.configure(bg=t["surface"], fg=t["ink"], insertbackground=t["ink"],
+                                     selectbackground=t["accent"], selectforeground=t["on_accent"])
+            self._configure_chat_tags()
         if hasattr(self, "width_preview"):
             self.width_preview.configure(bg=t["bg"])
+            self._update_width_preview()
+        if hasattr(self, "identity_dot"):
+            self.identity_dot.configure(bg=t["bg"])
+        for info in getattr(self, "_participant_rows", {}).values():
+            info["dot"].configure(bg=t["bg"])
+            info["last_fg"] = None
+        self._update_activity_indicators()
+        if self.debug_label is not None:
+            self.debug_label.configure(bg=t["surface"], fg=t["ink"])
+        self._update_permissions()
+
+    def _configure_chat_tags(self):
+        if not hasattr(self, "chat_text"):
+            return
+        t = self.theme
+        self.chat_text.tag_configure("time_tag", foreground=t["ink_muted"], font=("Segoe UI", 9))
+        self.chat_text.tag_configure("body_tag", foreground=t["ink"], font=("Segoe UI", 10))
+        for tag in self.chat_text.tag_names():
+            if tag.startswith("name_"):
+                user = tag[5:]
+                color = None
+                for u in self.state.participants:
+                    if u.get("name") == user:
+                        color = u.get("color")
+                        break
+                self.chat_text.tag_configure(tag, foreground=color or t["accent"],
+                                             font=("Segoe UI", 10, "bold"))
 
     # ------------------------------------------------------------------ #
     # Canvas geometry
     # ------------------------------------------------------------------ #
+    def _canvas_inset(self) -> int:
+        """Per-side pixels between the widget edge and the drawable area."""
+        border = int(self.canvas.cget("borderwidth") or 0)
+        highlight = int(self.canvas.cget("highlightthickness") or 0)
+        return border + highlight
+
+    def _canvas_size(self) -> tuple[int, int]:
+        return self.canvas.winfo_width(), self.canvas.winfo_height()
+
     def _on_canvas_configure(self, event):
-        self.scale, self.offset_x, self.offset_y = compute_scale(event.width, event.height)
+        self.scale, self.offset_x, self.offset_y = canvas_transform(
+            event.width, event.height, self._canvas_inset())
+        self._draw_board_background()
         self._redraw_all()
+        if self.debug_overlay:
+            self._raise_debug_overlay()
 
     def _to_logical(self, x, y):
-        return canvas_to_logical(x, y, self.canvas.winfo_width(), self.canvas.winfo_height(),
-                                 self.offset_x, self.offset_y, self.scale)
+        """Convert a raw widget pixel to clamped logical board coordinates."""
+        # canvasx/canvasy handle any future scrolling.  They do not remove
+        # the widget border, so the shared transform receives the same inset
+        # the configure handler used.
+        cx = self.canvas.canvasx(x)
+        cy = self.canvas.canvasy(y)
+        w, h = self._canvas_size()
+        return window_to_logical(cx, cy, w, h, self._canvas_inset())
+
+    def _to_window(self, lx, ly):
+        """Convert logical board coordinates back to raw widget pixels."""
+        w, h = self._canvas_size()
+        return logical_to_window(lx, ly, w, h, self._canvas_inset())
+
+    def _over_board(self, x, y) -> bool:
+        cx = self.canvas.canvasx(x)
+        cy = self.canvas.canvasy(y)
+        w, h = self._canvas_size()
+        return is_inside_board(cx, cy, w, h, self._canvas_inset())
+
+    def _erase_threshold(self) -> float:
+        """Ten screen pixels expressed in logical units."""
+        _scale, _ox, _oy = canvas_transform(*self._canvas_size(), self._canvas_inset())
+        return 10.0 / max(_scale, 0.001)
+
+    def _stroke_width(self, logical_width: float) -> float:
+        """Board units scaled to screen pixels, never thinner than one pixel."""
+        return max(1.0, float(logical_width) * max(self.scale, 0.001))
+
+    def _flatten_points(self, points) -> list[float]:
+        """Map logical points to one flat canvas pixel coordinate list."""
+        w, h = self._canvas_size()
+        inset = self._canvas_inset()
+        flat: list[float] = []
+        for pt in points:
+            if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                continue
+            cx, cy = logical_to_window(float(pt[0]), float(pt[1]), w, h, inset)
+            flat.extend((cx, cy))
+        return flat
+
+    def _toggle_debug_overlay(self):
+        self.debug_overlay = not self.debug_overlay
+        if self.debug_overlay:
+            if self.debug_label is None:
+                self.debug_label = tk.Label(self.canvas, text="", bg=self.theme["surface"],
+                                            fg=self.theme["ink"], font=("Courier", 9),
+                                            padx=4, pady=2, justify="left")
+            self._raise_debug_overlay()
+        else:
+            if self.debug_label is not None:
+                self.debug_label.place_forget()
+
+    def _raise_debug_overlay(self):
+        if self.debug_label is not None and self.debug_overlay:
+            self.debug_label.place(x=4, y=4)
+            self.debug_label.lift()
+
+    def _update_debug_overlay(self, event_x, event_y, lx, ly):
+        if not self.debug_overlay or self.debug_label is None:
+            return
+        w, h = self._canvas_size()
+        x0, y0, x1, y1 = board_rect(w, h, self._canvas_inset())
+        cx = self.canvas.canvasx(event_x)
+        cy = self.canvas.canvasy(event_y)
+        text = (f"raw=({event_x},{event_y}) canvas=({cx:.1f},{cy:.1f})\n"
+                f"logical=({lx:.1f},{ly:.1f}) board_px=({x0:.1f},{y0:.1f})-({x1:.1f},{y1:.1f})\n"
+                f"scale={self.scale:.4f} offset=({self.offset_x:.1f},{self.offset_y:.1f})"
+                f" inset={self._canvas_inset()}")
+        self.debug_label.config(text=text)
+        self._raise_debug_overlay()
 
     def _highlight_erase_target(self, sid):
-        # Restore previous highlight.
+        # Restore the previous highlight.  The id may refer to a stroke that
+        # was just deleted, so every lookup is defensive.
         prev = getattr(self, "_hover_erase", None)
         if prev is not None and prev in self.canvas_items:
             obj = self.state.objects.get(prev)
             if obj is not None:
-                self.canvas.itemconfig(self.canvas_items[prev], width=obj.get("width", 2),
-                                       fill=obj.get("color", "#000000"))
+                try:
+                    self.canvas.itemconfig(self.canvas_items[prev],
+                                           width=self._stroke_width(obj.get("width", 2)),
+                                           fill=obj.get("color", "#000000"))
+                except tk.TclError:
+                    pass
         self._hover_erase = sid
         if sid is not None and sid in self.canvas_items:
             item = self.canvas_items[sid]
-            self.canvas.itemconfig(item, width=max(2, (self.state.objects.get(sid, {}).get("width", 2) + 4)),
-                                   fill=self.theme["accent"])
+            obj = self.state.objects.get(sid, {})
+            try:
+                self.canvas.itemconfig(item,
+                                       width=self._stroke_width(obj.get("width", 2)) + 4,
+                                       fill=self.theme["board_accent"])
+            except tk.TclError:
+                self._hover_erase = None
 
     # ------------------------------------------------------------------ #
     # Drawing input
     # ------------------------------------------------------------------ #
     def _on_press(self, event):
-        # Ignore presses outside the drawable board area.
-        if self.scale <= 0:
-            return
-        raw_lx = (event.x - self.offset_x) / self.scale
-        raw_ly = (event.y - self.offset_y) / self.scale
-        if not (0 <= raw_lx <= 1600 and 0 <= raw_ly <= 900):
+        # Ignore presses in the letterbox/surround; only the paper is
+        # drawable.  Using the shared transform keeps this consistent with
+        # the pen and eraser hit-tests.
+        if not self._over_board(event.x, event.y):
             return
         lx, ly = self._to_logical(event.x, event.y)
+        self._update_debug_overlay(event.x, event.y, lx, ly)
         self._last_erased = None
+        if self.role == "viewer":
+            self._toast("Viewers cannot draw.")
+            return
         if self.tool == "pen":
             sid = str(uuid.uuid4())
             op_id = str(uuid.uuid4())
-            item = self.canvas.create_line(lx, ly, lx, ly, fill=self.color, width=self.width,
+            cx, cy = self._to_window(lx, ly)
+            item = self.canvas.create_line(cx, cy, cx, cy, fill=self.color,
+                                           width=self._stroke_width(self.width),
                                            capstyle="round", smooth=True, tags=(sid,))
             self.canvas_items[sid] = item
+            self._raise_matte()
+            # The press point is the first local point and the first point
+            # of the first stroke_points batch.  The visible line therefore
+            # starts exactly under the cursor instead of at the first motion
+            # event.
             self.local_strokes[sid] = {
-                "op_id": op_id,
                 "points": [[lx, ly]],
                 "last_send": time.time(),
-                "batch": [],
+                "batch": [[lx, ly]],
+            }
+            # Mirror the local stroke immediately; the eraser can then hit
+            # your own line before the server echo arrives.
+            self.state.objects[sid] = {
+                "id": sid,
+                "type": "stroke",
+                "tool": "pen",
+                "color": self.color,
+                "width": self.width,
+                "points": [[lx, ly]],
+                "user": self.username,
+                "seq": 0,
             }
             self.state.track_pending(op_id)
             self.state.start_drawing(self.username)
@@ -579,45 +832,41 @@ class WhiteboardApp:
                                "tool": "pen", "color": self.color, "width": self.width,
                                "x": lx, "y": ly})
         elif self.tool == "eraser":
-            sid = find_stroke_at(self.state.objects, lx, ly, threshold=10.0 / max(self.scale, 0.001))
-            if sid and self.net and self.role != "viewer":
-                self.net.send({"type": "delete_object", "op_id": str(uuid.uuid4()), "target_id": sid})
-                logging.getLogger("whiteboard.ui").debug("sent delete_object target=%s", sid)
-            elif sid and self.role == "viewer":
-                self._toast("Viewers cannot erase strokes.")
+            self._erase_at(lx, ly)
 
     def _on_motion(self, event):
         lx, ly = self._to_logical(event.x, event.y)
+        self._update_debug_overlay(event.x, event.y, lx, ly)
         if self.tool == "pen":
             # Find the active stroke (last one being drawn).
             if not self.local_strokes:
                 return
             sid = list(self.local_strokes.keys())[-1]
             info = self.local_strokes[sid]
+            if info["points"] and [lx, ly] == info["points"][-1]:
+                return
             info["points"].append([lx, ly])
-            # Extend the polyline.
+            self.state.objects.setdefault(sid, {"id": sid, "type": "stroke", "points": []})["points"].append([lx, ly])
+            # Extend the polyline.  The model stores logical units; the
+            # canvas stores pixels, so every update goes through the shared
+            # transform.
             item = self.canvas_items.get(sid)
             if item is not None:
-                flat = [c for pt in info["points"] for c in pt]
-                self.canvas.coords(item, *flat)
-            # Batch points.
+                flat = self._flatten_points(info["points"])
+                if len(flat) >= 4:
+                    self.canvas.coords(item, *flat)
+                    self._raise_matte()
+            # Batch points.  The batch already starts with the press point.
             info["batch"].append([lx, ly])
             now = time.time()
             if now - info["last_send"] >= 0.04 and info["batch"]:
-                if self.net:
-                    self.net.send({"type": "stroke_points", "op_id": str(uuid.uuid4()),
-                                   "stroke_id": sid, "points": info["batch"]})
-                self.state.note_drawing(self.username, now)
+                self._send_stroke_points(sid, info["batch"])
                 info["batch"] = []
                 info["last_send"] = now
+                self.state.note_drawing(self.username, now)
         elif self.tool == "eraser":
             # Hover highlight and sweep-to-erase.
-            sid = find_stroke_at(self.state.objects, lx, ly, threshold=10.0 / max(self.scale, 0.001))
-            self._highlight_erase_target(sid)
-            if sid and self.net and self.role != "viewer" and sid != getattr(self, "_last_erased", None):
-                self.net.send({"type": "delete_object", "op_id": str(uuid.uuid4()), "target_id": sid})
-                logging.getLogger("whiteboard.ui").debug("sent delete_object target=%s", sid)
-                self._last_erased = sid
+            self._erase_at(lx, ly)
         else:
             # Throttled cursor move.
             now = time.time()
@@ -625,22 +874,74 @@ class WhiteboardApp:
                 self.net.send({"type": "cursor_move", "x": lx, "y": ly})
                 self._last_cursor_send = now
 
+    def _send_stroke_points(self, sid: str, points: list[list[float]]) -> None:
+        if not points or not self.net:
+            return
+        # Clamp defensively one more time: no point may ever leave the board.
+        safe = [[max(0.0, min(float(LOGICAL_WIDTH), float(p[0]))),
+                 max(0.0, min(float(LOGICAL_HEIGHT), float(p[1])))] for p in points]
+        op_id = str(uuid.uuid4())
+        self.state.track_pending(op_id)
+        self.net.send({"type": "stroke_points", "op_id": op_id,
+                       "stroke_id": sid, "points": safe})
+
+    def _erase_at(self, lx: float, ly: float) -> None:
+        sid = find_stroke_at(self.state.objects, lx, ly, threshold=self._erase_threshold())
+        self._highlight_erase_target(sid)
+        if not sid:
+            return
+        if self.role == "viewer":
+            self._toast("Viewers cannot erase strokes.")
+            return
+        if not self.net or sid == getattr(self, "_last_erased", None):
+            return
+        op_id = str(uuid.uuid4())
+        self._last_delete = {"op_id": op_id, "target_id": sid}
+        self.net.send({"type": "delete_object", "op_id": op_id, "target_id": sid})
+        logging.getLogger("whiteboard.ui").debug("sent delete_object op=%s target=%s", op_id, sid)
+        self._last_erased = sid
+
     def _on_release(self, event):
         if self.tool != "pen" or not self.local_strokes:
             return
+        lx, ly = self._to_logical(event.x, event.y)
         sid = list(self.local_strokes.keys())[-1]
-        info = self.local_strokes.pop(sid)
-        # Flush remaining batch.
-        if info["batch"] and self.net:
-            self.net.send({"type": "stroke_points", "op_id": str(uuid.uuid4()),
-                           "stroke_id": sid, "points": info["batch"]})
+        info = self.local_strokes.get(sid)
+        if info is None:
+            return
+        # Add the release point when it adds information; never duplicate
+        # the previous sample.
+        if info["points"] and [lx, ly] != info["points"][-1]:
+            info["points"].append([lx, ly])
+            self.state.objects.setdefault(sid, {"id": sid, "type": "stroke", "points": []})["points"].append([lx, ly])
+            item = self.canvas_items.get(sid)
+            if item is not None:
+                flat = self._flatten_points(info["points"])
+                if len(flat) >= 4:
+                    self.canvas.coords(item, *flat)
+                    self._raise_matte()
+            info["batch"].append([lx, ly])
+        # Flush remaining batch (it starts with the press point).
+        if info["batch"]:
+            self._send_stroke_points(sid, info["batch"])
+        self.local_strokes.pop(sid, None)
         if self.net:
-            self.net.send({"type": "stroke_end", "op_id": str(uuid.uuid4()), "stroke_id": sid})
+            op_id = str(uuid.uuid4())
+            self.state.track_pending(op_id)
+            self.net.send({"type": "stroke_end", "op_id": op_id, "stroke_id": sid})
         self.state.end_drawing(self.username)
 
     def _on_hover(self, event):
-        # Keep cursor updates light; handled in motion.
-        pass
+        # The hover highlight is part of the eraser's affordance; pen hover
+        # does not need a canvas update.
+        if self.tool != "eraser" or not self._over_board(event.x, event.y):
+            if self.tool == "eraser":
+                self._highlight_erase_target(None)
+            return
+        lx, ly = self._to_logical(event.x, event.y)
+        self._update_debug_overlay(event.x, event.y, lx, ly)
+        self._highlight_erase_target(find_stroke_at(self.state.objects, lx, ly,
+                                                    threshold=self._erase_threshold()))
 
     # ------------------------------------------------------------------ #
     # Polling and message handling
@@ -711,20 +1012,7 @@ class WhiteboardApp:
                         self.root.title(f"LAN Whiteboard - {self.username} ({self.role}) - Room {self.room_code}")
                         if hasattr(self, "identity_role"):
                             self.identity_role.config(text=self.role)
-                        if self.role != "host":
-                            if hasattr(self, "clear_btn"):
-                                self.clear_btn.state(["disabled"])
-                            if hasattr(self, "save_btn"):
-                                self.save_btn.state(["disabled"])
-                            if hasattr(self, "load_btn"):
-                                self.load_btn.state(["disabled"])
-                        else:
-                            if hasattr(self, "clear_btn"):
-                                self.clear_btn.state(["!disabled"])
-                            if hasattr(self, "save_btn"):
-                                self.save_btn.state(["!disabled"])
-                            if hasattr(self, "load_btn"):
-                                self.load_btn.state(["!disabled"])
+                        self._update_permissions()
                 self._rebuild_participants()
             return
         if mtype in ("user_joined", "user_left", "user_reconnected"):
@@ -763,6 +1051,8 @@ class WhiteboardApp:
                     if item is not None:
                         self.canvas.delete(item)
                     self.state.objects.pop(tid, None)
+                    if getattr(self, "_hover_erase", None) == tid:
+                        self._hover_erase = None
                 return
             # Render remote stroke updates.
             self._render_op(msg)
@@ -831,10 +1121,9 @@ class WhiteboardApp:
                         self.state.objects.pop(tid, None)
             return
         if mtype == "clear_canvas":
-            self.canvas.delete("all")
-            self.canvas_items.clear()
             self.state.objects.clear()
             self.state.clear_drawers()
+            self._redraw_all()
             return
         if mtype == "kicked":
             self.state.remove_drawer(self.username)
@@ -853,10 +1142,16 @@ class WhiteboardApp:
             ts = msg.get("ts")
             if isinstance(ts, (int, float)) and not isinstance(ts, bool):
                 rtt = (time.time() - float(ts)) * 1000.0
-                if hasattr(self, "status_latency"):
-                    self.status_latency.config(text=f"latency: {int(rtt)} ms")
+                text = f"latency: {int(rtt)} ms"
+                if hasattr(self, "status_latency") and getattr(self, "_last_latency_text", None) != text:
+                    self._last_latency_text = text
+                    self.status_latency.config(text=text)
             return
         if mtype == "error":
+            # Keep the sent operation next to the rejection in the log; that
+            # is what makes an eraser rejection diagnosable.
+            logging.getLogger("whiteboard.ui").warning(
+                "server rejected message=%s last_delete=%s", msg, getattr(self, "_last_delete", None))
             self._toast(f"Rejected: {msg.get('message', msg.get('code'))}")
             return
 
@@ -872,9 +1167,12 @@ class WhiteboardApp:
             y = op.get("y", 0)
             color = op.get("color", "#000000")
             width = op.get("width", 2)
-            item = self.canvas.create_line(x, y, x, y, fill=color, width=width,
+            cx, cy = self._to_window(float(x), float(y))
+            item = self.canvas.create_line(cx, cy, cx, cy, fill=color,
+                                           width=self._stroke_width(width),
                                            capstyle="round", smooth=True, tags=(sid,))
             self.canvas_items[sid] = item
+            self._raise_matte()
         elif mtype == "stroke_points":
             sid = op.get("stroke_id")
             item = self.canvas_items.get(sid) if isinstance(sid, str) else None
@@ -882,9 +1180,10 @@ class WhiteboardApp:
             if item is None:
                 return
             if obj is not None:
-                flat = [c for pt in obj.get("points", []) for c in pt]
+                flat = self._flatten_points(obj.get("points", []))
                 if len(flat) >= 4:
                     self.canvas.coords(item, *flat)
+                    self._raise_matte()
         # stroke_end needs no visual change.
 
     def _add_stroke_item(self, obj: dict[str, Any]) -> None:
@@ -896,44 +1195,69 @@ class WhiteboardApp:
             pts = [[0, 0], [0, 0]]
         if len(pts) == 1:
             pts = [pts[0], pts[0]]
-        flat = [c for pt in pts for c in pt]
+        flat = self._flatten_points(pts)
+        if len(flat) < 4:
+            return
         color = obj.get("color", "#000000")
         width = obj.get("width", 2)
-        item = self.canvas.create_line(*flat, fill=color, width=width,
+        item = self.canvas.create_line(*flat, fill=color,
+                                       width=self._stroke_width(width),
                                        capstyle="round", smooth=True, tags=(sid,))
         self.canvas_items[sid] = item
+        self._raise_matte()
 
     def _draw_board_background(self) -> None:
         self.canvas.delete("board_bg")
-        x0, y0 = logical_to_canvas(0, 0, self.offset_x, self.offset_y, self.scale)
-        x1, y1 = logical_to_canvas(1600, 900, self.offset_x, self.offset_y, self.scale)
-        self.canvas.create_rectangle(x0, y0, x1, y1, fill=self.theme["surface"],
-                                     outline=self.theme["border"], width=1, tags=("board_bg",))
+        w, h = self._canvas_size()
+        x0, y0, x1, y1 = board_rect(w, h, self._canvas_inset())
+        # Always light paper, even in the dark theme, so dark ink and the
+        # coloured strokes stay readable.  The surround carries the theme.
+        self.canvas.create_rectangle(x0, y0, x1, y1, fill=self.theme["paper"],
+                                     outline=self.theme["paper_border"], width=2,
+                                     tags=("board_bg",))
         self.canvas.tag_lower("board_bg")
+        self._draw_clip_matte()
+
+    def _draw_clip_matte(self) -> None:
+        """Cover everything outside the paper with the surround colour.
+
+        Tk canvases have no clip rectangle, so four opaque rectangles act as
+        a matte.  They are raised above strokes and cursor markers below.
+        """
+        self.canvas.delete("matte")
+        w, h = self._canvas_size()
+        x0, y0, x1, y1 = board_rect(w, h, self._canvas_inset())
+        surround = self.theme["canvas"]
+        for coords in ((0, 0, max(0, x0), h),
+                       (x1, 0, w, h),
+                       (x0, 0, x1, max(0, y0)),
+                       (x0, y1, x1, h)):
+            self.canvas.create_rectangle(*coords, fill=surround, outline="",
+                                         tags=("matte",))
+        self._raise_matte()
+
+    def _raise_matte(self) -> None:
+        try:
+            self.canvas.tag_raise("matte")
+        except tk.TclError:
+            pass
 
     def _redraw_all(self) -> None:
         self.canvas.delete("all")
-        self._draw_board_background()
         self.canvas_items.clear()
+        # Item ids in cursor_items are stale after delete("all"); the next
+        # cursor message recreates them.
+        self.cursor_items.clear()
+        self._hover_erase = None
+        self._draw_board_background()
         for sid, obj in self.state.objects.items():
             pts = obj.get("points", [])
             if not isinstance(pts, list) or len(pts) < 1:
                 continue
-            if len(pts) == 1:
-                pts = [pts[0], pts[0]]
-            flat = [c for pt in pts for c in pt]
-            color = obj.get("color", "#000000")
-            width = obj.get("width", 2)
-            item = self.canvas.create_line(*flat, fill=color, width=width,
-                                           capstyle="round", smooth=True, tags=(sid,))
-            self.canvas_items[sid] = item
-        # Redraw cursors on top.
-        for user, item in list(self.cursor_items.items()):
-            if isinstance(item, tuple):
-                for it in item:
-                    self.canvas.tag_raise(it)
-            else:
-                self.canvas.tag_raise(item)
+            self._add_stroke_item(obj)
+        self.canvas.tag_raise("matte")
+        if self.debug_overlay:
+            self._raise_debug_overlay()
 
     # ------------------------------------------------------------------ #
     # Participants and chat
@@ -948,7 +1272,8 @@ class WhiteboardApp:
         signature = tuple((u.get("name"), u.get("role"), u.get("online"), u.get("color")) for u in self.state.participants)
         if hasattr(self, "host_target"):
             names = [u.get("name", "") for u in self.state.participants if u.get("name") != self.username]
-            self.host_target["values"] = names
+            if tuple(self.host_target["values"]) != tuple(names):
+                self.host_target["values"] = names
             if self.host_target.get() not in names:
                 if names:
                     self.host_target.set(names[0])
@@ -1003,9 +1328,18 @@ class WhiteboardApp:
             color = info.get("color", "#888888")
             if active:
                 glyph = "\u270e" if not self._blink else "\u270f"
-                info["draw_label"].config(text=glyph, foreground=color)
+                foreground = color
             else:
-                info["draw_label"].config(text="", foreground=self.theme["ink_muted"])
+                glyph = ""
+                foreground = self.theme["ink_muted"]
+            # The reserved slot is always present; only its glyph/colour
+            # changes, and only when the value really changed.
+            if info.get("last_glyph") != glyph:
+                info["last_glyph"] = glyph
+                info["draw_label"].config(text=glyph)
+            if info.get("last_fg") != foreground:
+                info["last_fg"] = foreground
+                info["draw_label"].config(foreground=foreground)
 
     def _append_chat(self, user, text, timestamp):
         self.chat_text.config(state="normal")
@@ -1013,14 +1347,13 @@ class WhiteboardApp:
             ts = time.strftime("%H:%M", time.localtime(timestamp)) if timestamp else ""
         except (TypeError, ValueError, OSError):
             ts = ""
-        color = "#1E5B6B"
+        color = self.theme["accent"]
         for u in self.state.participants:
             if u.get("name") == user:
                 color = u.get("color", color)
+        self._configure_chat_tags()
         name_tag = f"name_{user}"
         self.chat_text.tag_configure(name_tag, foreground=color, font=("Segoe UI", 10, "bold"))
-        self.chat_text.tag_configure("time_tag", foreground=self.theme["ink_muted"], font=("Segoe UI", 9))
-        self.chat_text.tag_configure("body_tag", foreground=self.theme["ink"], font=("Segoe UI", 10))
         self.chat_text.insert("end", f"{user}", name_tag)
         if ts:
             self.chat_text.insert("end", f"  {ts}", "time_tag")
@@ -1043,10 +1376,16 @@ class WhiteboardApp:
         self.net.send({"type": "chat", "text": text})
 
     def _undo(self):
+        if self.role == "viewer":
+            self._toast("Viewers cannot do this.")
+            return
         if self.net:
             self.net.send({"type": "undo", "op_id": str(uuid.uuid4())})
 
     def _redo(self):
+        if self.role == "viewer":
+            self._toast("Viewers cannot do this.")
+            return
         if self.net:
             self.net.send({"type": "redo", "op_id": str(uuid.uuid4())})
 
@@ -1098,6 +1437,8 @@ class WhiteboardApp:
             self.net.send({"type": "lock_room", "locked": bool(self.lock_var.get())})
 
     def _toast(self, text):
+        if not hasattr(self, "status_conn"):
+            return
         self.status_conn.config(text=text)
         self.root.after(3000, lambda: self.status_conn.config(
             text="Connected" if (self.net and self.net.connected) else "Disconnected"))
@@ -1123,19 +1464,29 @@ class WhiteboardApp:
         y = msg.get("y")
         if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
             return
-        cx, cy = (x * self.scale + self.offset_x, y * self.scale + self.offset_y)
+        lx = max(0.0, min(float(LOGICAL_WIDTH), float(x)))
+        ly = max(0.0, min(float(LOGICAL_HEIGHT), float(y)))
+        cx, cy = self._to_window(lx, ly)
         color = "#888888"
         for u in self.state.participants:
             if u.get("name") == user:
                 color = u.get("color", color)
         active = user in self.state.active_drawers
+        # Keep the label inside the paper when the marker is near the edge.
+        text_x = cx + 8
+        anchor = "w"
+        if text_x + 70 > self.canvas.winfo_width():
+            text_x = cx - 8
+            anchor = "e"
         item = self.cursor_items.get(user)
         if item is None:
             if active:
                 oval = self.canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, fill=color, outline=color, tags=("cursor",))
             else:
                 oval = self.canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, fill="", outline=color, tags=("cursor",))
-            text = self.canvas.create_text(cx + 8, cy, text=user, fill=color, font=("Segoe UI", 9, "bold"), anchor="w", tags=("cursor",))
+            text = self.canvas.create_text(text_x, cy, text=user, fill=color,
+                                           font=("Segoe UI", 9, "bold"), anchor=anchor,
+                                           tags=("cursor",))
             self.cursor_items[user] = (oval, text)
         else:
             oval, text = item
@@ -1144,15 +1495,20 @@ class WhiteboardApp:
             else:
                 self.canvas.itemconfig(oval, fill="", outline=color)
             self.canvas.coords(oval, cx - 4, cy - 4, cx + 4, cy + 4)
-            self.canvas.coords(text, cx + 8, cy)
+            self.canvas.coords(text, text_x, cy)
+            self.canvas.itemconfig(text, anchor=anchor)
+        self._raise_matte()
 
     # ------------------------------------------------------------------ #
     # Status
     # ------------------------------------------------------------------ #
     def _update_status(self):
-        if self.net is None:
+        if self.net is None or not hasattr(self, "status_conn"):
             return
-        self.status_conn.config(text=f"Connected | room {self.room_code}")
+        conn = f"Connected | room {self.room_code}"
+        if getattr(self, "_last_conn_text", None) != conn:
+            self._last_conn_text = conn
+            self.status_conn.config(text=conn)
         # Activity text.
         drawers = sorted(self.state.active_drawers)
         if len(drawers) == 1:
@@ -1163,9 +1519,13 @@ class WhiteboardApp:
             activity = f"{len(drawers)} people are drawing"
         else:
             activity = ""
-        if hasattr(self, "status_activity"):
+        if getattr(self, "_last_activity_text", None) != activity:
+            self._last_activity_text = activity
             self.status_activity.config(text=activity)
-        self.status_seq.config(text=f"seq: {self.state.applied_seq}")
+        seq_text = f"seq: {self.state.applied_seq}"
+        if getattr(self, "_last_seq_text", None) != seq_text:
+            self._last_seq_text = seq_text
+            self.status_seq.config(text=seq_text)
 
 
 class Tooltip:
@@ -1173,8 +1533,16 @@ class Tooltip:
         self.widget = widget
         self.text = text
         self.tip = None
+        # Let permission updates find and rewrite an existing tooltip.
+        widget._tooltip = self
         widget.bind("<Enter>", self.show)
         widget.bind("<Leave>", self.hide)
+
+    def set_text(self, text):
+        self.text = text
+        if self.tip is not None:
+            self.hide()
+            self.show()
 
     def show(self, _event=None):
         if self.tip is not None:
