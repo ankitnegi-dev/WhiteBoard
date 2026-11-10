@@ -148,11 +148,15 @@ def test_shapes_split_button_and_palette(app):
 def test_new_toolbar_buttons_exist_and_disabled(app):
     root, application = app
     root.update()
-    for name in ("select_btn", "sticky_btn", "export_btn", "history_btn"):
+    for name in ("select_btn", "sticky_btn", "export_btn"):
         button = getattr(application, name)
         assert button.winfo_class() == "TButton"
-        assert button.instate(["disabled"])
+        assert not button.instate(["disabled"])
         assert button._tooltip is not None
+    history = application.history_btn
+    assert history.winfo_class() == "TButton"
+    assert history.instate(["disabled"])
+    assert history._tooltip.text == "Coming soon"
     root, application = app
     root.update()
     before = application.fill_btn.winfo_height()

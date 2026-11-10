@@ -245,7 +245,8 @@ def handle_client(
 
             # Rate limiting for ops.
             op_types = {"stroke_start", "stroke_points", "stroke_end", "delete_object",
-                        "chat", "undo", "redo", "clear_canvas", "cursor_move"}
+                        "chat", "undo", "redo", "clear_canvas", "cursor_move",
+                        "shape", "text", "sticky", "edit_object", "move_object"}
             if mtype in op_types and not _rate_ok():
                 enqueue({"type": "error", "code": "rate_limited", "message": "too many ops per second"})
                 continue
@@ -276,7 +277,7 @@ def handle_client(
                     )
                 continue
             elif mtype in ("stroke_start", "stroke_points", "stroke_end", "delete_object",
-                           "shape", "text"):
+                           "shape", "text", "sticky", "edit_object", "move_object"):
                 status, op, reason = room.apply_op(msg, state["username"], state["role"])
                 if status == "duplicate":
                     continue

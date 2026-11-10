@@ -11,9 +11,13 @@ from __future__ import annotations
 import re
 
 try:
-    from protocol import SHAPE_KINDS
+    from protocol import SHAPE_KINDS, STICKY_COLORS, STICKY_WIDTH, STICKY_HEIGHT, MAX_STICKY_TEXT
 except Exception:  # pragma: no cover
     SHAPE_KINDS = ("line", "rect", "ellipse", "arrow")
+    STICKY_COLORS = ("#FFF2A8", "#FFD6A5", "#FDFFB6", "#CAFFBF", "#A0C4FF")
+    STICKY_WIDTH = 220
+    STICKY_HEIGHT = 160
+    MAX_STICKY_TEXT = 300
 import threading
 import time
 from dataclasses import dataclass
@@ -30,13 +34,14 @@ CANVAS_HEIGHT = 900
 
 MAX_POINT_BATCH = 500
 MAX_TEXT_LENGTH = 500
+MAX_STICKY_TEXT = 300
 MAX_WIDTH = 50.0
 MIN_WIDTH = 1.0
 MAX_CHAT_LENGTH = 500
 MAX_OPS_SINCE = 1000
 
 DRAWING_OPS = {"stroke_start", "stroke_points", "stroke_end", "delete_object",
-               "shape", "text"}
+               "shape", "text", "sticky", "edit_object", "move_object"}
 TOOLS = {"pen", "eraser"}
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -235,6 +240,44 @@ class Room:
                 return False, "bad_color"
             return True, ""
 
+        if mtype == "sticky":
+            if not self._require_str(msg.get("op_id")):
+                return False, "bad_op_id"
+            if not self._require_str(msg.get("obj_id")):
+                return False, "bad_obj_id"
+            if not self._in_canvas(msg.get("x"), msg.get("y")):
+                return False, "bad_coordinates"
+            t = msg.get("text")
+            if not isinstance(t, str) or not t.strip():
+                return False, "bad_text"
+            if len(t) > MAX_STICKY_TEXT:
+                return False, "text_too_long"
+            color = msg.get("color")
+            if color not in STICKY_COLORS:
+                return False, "bad_color"
+            return True, ""
+
+        if mtype == "edit_object":
+            if not self._require_str(msg.get("op_id")):
+                return False, "bad_op_id"
+            if not self._require_str(msg.get("target_id")):
+                return False, "bad_target_id"
+            t = msg.get("text")
+            if not isinstance(t, str) or not t.strip():
+                return False, "bad_text"
+            if len(t) > MAX_STICKY_TEXT:
+                return False, "text_too_long"
+            return True, ""
+
+        if mtype == "move_object":
+            if not self._require_str(msg.get("op_id")):
+                return False, "bad_op_id"
+            if not self._require_str(msg.get("target_id")):
+                return False, "bad_target_id"
+            if not self._in_canvas(msg.get("x"), msg.get("y")):
+                return False, "bad_coordinates"
+            return True, ""
+
         return False, "unknown_type"
 
     def _require_str(self, v: Any) -> bool:
@@ -334,6 +377,52 @@ class Room:
                 self.undo_stacks.setdefault(username, []).append(
                     {"kind": "object", "user": username, "object_id": oid, "object": dict(obj)}
                 )
+            elif mtype == "sticky":
+                oid = msg["obj_id"]
+                if oid in self.objects:
+                    return "invalid", None, "sticky_already_exists"
+                obj = {
+                    "id": oid,
+                    "type": "sticky",
+                    "x": msg["x"],
+                    "y": msg["y"],
+                    "text": msg["text"],
+                    "color": msg["color"],
+                    "width": STICKY_WIDTH,
+                    "height": STICKY_HEIGHT,
+                    "user": username,
+                }
+                self.objects[oid] = obj
+                self.redo_stacks.pop(username, None)
+                self.undo_stacks.setdefault(username, []).append(
+                    {"kind": "object", "user": username, "object_id": oid, "object": dict(obj)}
+                )
+            elif mtype == "edit_object":
+                tid = msg["target_id"]
+                obj = self.objects.get(tid)
+                if obj is None or obj.get("type") != "sticky":
+                    return "invalid", None, "target_not_found"
+                old_text = obj.get("text", "")
+                obj["text"] = msg["text"]
+                self.redo_stacks.pop(username, None)
+                self.undo_stacks.setdefault(username, []).append(
+                    {"kind": "edit", "user": username, "target_id": tid,
+                     "previous": old_text, "new": msg["text"]}
+                )
+            elif mtype == "move_object":
+                tid = msg["target_id"]
+                obj = self.objects.get(tid)
+                if obj is None or obj.get("type") != "sticky":
+                    return "invalid", None, "target_not_found"
+                old_x = obj.get("x")
+                old_y = obj.get("y")
+                obj["x"] = msg["x"]
+                obj["y"] = msg["y"]
+                self.redo_stacks.pop(username, None)
+                self.undo_stacks.setdefault(username, []).append(
+                    {"kind": "move", "user": username, "target_id": tid,
+                     "previous": [old_x, old_y], "new": [msg["x"], msg["y"]]}
+                )
 
             # Stamp and append.
             self.seq += 1
@@ -346,7 +435,7 @@ class Room:
             self.op_log.append(op)
             self.dirty = True
             # Attach seq to the object for snapshots.
-            if mtype in ("stroke_start", "stroke_points", "stroke_end"):
+            if mtype in ("stroke_start", "stroke_points", "stroke_end", "sticky"):
                 obj = self.objects.get(msg.get("stroke_id"))
                 if obj is not None:
                     obj["seq"] = self.seq
@@ -431,6 +520,30 @@ class Room:
                     del self.objects[oid]
                 broadcast = {"type": "undo", "op_id": op_id, "action": "remove_object",
                               "target_id": oid, "user": username}
+            elif kind == "edit":
+                tid = entry.get("target_id")
+                obj = self.objects.get(tid) if isinstance(tid, str) else None
+                if obj is None:
+                    return "noop", None, "target already removed"
+                previous = entry.get("previous")
+                if isinstance(previous, str):
+                    obj["text"] = previous
+                broadcast = {"type": "undo", "op_id": op_id, "action": "edit_object",
+                             "target_id": tid, "text": previous, "user": username}
+            elif kind == "move":
+                tid = entry.get("target_id")
+                obj = self.objects.get(tid) if isinstance(tid, str) else None
+                if obj is None:
+                    return "noop", None, "target already removed"
+                previous = entry.get("previous")
+                if isinstance(previous, (list, tuple)) and len(previous) == 2:
+                    obj["x"] = previous[0]
+                    obj["y"] = previous[1]
+                broadcast = {"type": "undo", "op_id": op_id, "action": "move_object",
+                             "target_id": tid,
+                             "x": previous[0] if isinstance(previous, (list, tuple)) and len(previous) == 2 else obj.get("x"),
+                             "y": previous[1] if isinstance(previous, (list, tuple)) and len(previous) == 2 else obj.get("y"),
+                             "user": username}
             elif kind == "clear":
                 for o in entry.get("cleared", []):
                     if isinstance(o, dict) and "id" in o and o["id"] not in self.objects:
@@ -481,6 +594,30 @@ class Room:
                     self.objects[obj["id"]] = dict(obj)
                 broadcast = {"type": "redo", "op_id": op_id, "action": "add_object",
                               "object": dict(obj) if isinstance(obj, dict) else None, "user": username}
+            elif kind == "edit":
+                tid = entry.get("target_id")
+                obj = self.objects.get(tid) if isinstance(tid, str) else None
+                if obj is None:
+                    return "noop", None, "target already removed"
+                new_text = entry.get("new")
+                if isinstance(new_text, str):
+                    obj["text"] = new_text
+                broadcast = {"type": "redo", "op_id": op_id, "action": "edit_object",
+                             "target_id": tid, "text": new_text, "user": username}
+            elif kind == "move":
+                tid = entry.get("target_id")
+                obj = self.objects.get(tid) if isinstance(tid, str) else None
+                if obj is None:
+                    return "noop", None, "target already removed"
+                new_pos = entry.get("new")
+                if isinstance(new_pos, (list, tuple)) and len(new_pos) == 2:
+                    obj["x"] = new_pos[0]
+                    obj["y"] = new_pos[1]
+                broadcast = {"type": "redo", "op_id": op_id, "action": "move_object",
+                             "target_id": tid,
+                             "x": new_pos[0] if isinstance(new_pos, (list, tuple)) and len(new_pos) == 2 else obj.get("x"),
+                             "y": new_pos[1] if isinstance(new_pos, (list, tuple)) and len(new_pos) == 2 else obj.get("y"),
+                             "user": username}
             elif kind == "clear":
                 ids = [o["id"] for o in entry.get("cleared", []) if isinstance(o, dict) and "id" in o]
                 for tid in ids:

@@ -168,22 +168,34 @@ class BoardState:
                 }
             self.start_drawing(user if isinstance(user, str) else "")
             self.end_drawing(user if isinstance(user, str) else "")
-        elif mtype == "text":
+        elif mtype == "sticky":
             oid = op.get("obj_id")
             if isinstance(oid, str):
                 self.objects[oid] = {
                     "id": oid,
-                    "type": "text",
+                    "type": "sticky",
                     "x": op.get("x", 0),
                     "y": op.get("y", 0),
                     "text": op.get("text", ""),
-                    "size": op.get("size", 12),
-                    "color": op.get("color", "#000000"),
+                    "color": op.get("color", "#FFF2A8"),
+                    "width": 220,
+                    "height": 160,
                     "user": user,
                     "seq": op.get("seq", 0),
                 }
             self.start_drawing(user if isinstance(user, str) else "")
             self.end_drawing(user if isinstance(user, str) else "")
+        elif mtype == "edit_object":
+            tid = op.get("target_id")
+            obj = self.objects.get(tid) if isinstance(tid, str) else None
+            if obj is not None:
+                obj["text"] = op.get("text", obj.get("text", ""))
+        elif mtype == "move_object":
+            tid = op.get("target_id")
+            obj = self.objects.get(tid) if isinstance(tid, str) else None
+            if obj is not None:
+                obj["x"] = op.get("x", obj.get("x", 0))
+                obj["y"] = op.get("y", obj.get("y", 0))
         elif mtype == "delete_object":
             tid = op.get("target_id")
             if isinstance(tid, str):
@@ -213,6 +225,19 @@ class BoardState:
                 for obj in op.get("objects", []):
                     if isinstance(obj, dict) and "id" in obj:
                         self.objects[obj["id"]] = dict(obj)
+            elif action == "edit_object":
+                tid = op.get("target_id")
+                obj = self.objects.get(tid) if isinstance(tid, str) else None
+                if obj is not None and "text" in op:
+                    obj["text"] = op.get("text")
+            elif action == "move_object":
+                tid = op.get("target_id")
+                obj = self.objects.get(tid) if isinstance(tid, str) else None
+                if obj is not None:
+                    if "x" in op:
+                        obj["x"] = op.get("x")
+                    if "y" in op:
+                        obj["y"] = op.get("y")
         elif mtype == "redo":
             action = op.get("action")
             if action == "add_stroke":
@@ -227,6 +252,19 @@ class BoardState:
                 for tid in op.get("target_ids", []):
                     if isinstance(tid, str):
                         self.objects.pop(tid, None)
+            elif action == "edit_object":
+                tid = op.get("target_id")
+                obj = self.objects.get(tid) if isinstance(tid, str) else None
+                if obj is not None and "text" in op:
+                    obj["text"] = op.get("text")
+            elif action == "move_object":
+                tid = op.get("target_id")
+                obj = self.objects.get(tid) if isinstance(tid, str) else None
+                if obj is not None:
+                    if "x" in op:
+                        obj["x"] = op.get("x")
+                    if "y" in op:
+                        obj["y"] = op.get("y")
 
     def apply_ops_since(self, from_seq: int, ops: list[dict[str, Any]]) -> None:
         for op in sorted(ops, key=lambda o: o.get("seq", 0)):

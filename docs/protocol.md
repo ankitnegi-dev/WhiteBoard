@@ -52,10 +52,14 @@ Example:
 - stroke_start {op_id, stroke_id, tool, color, width, x, y}
 - stroke_points {op_id, stroke_id, points: [[x, y], ...]} (batched every 30-50 ms)
 - stroke_end {op_id, stroke_id}
-- shape {op_id, shape_id, kind: line|rect|ellipse|arrow, p1, p2, color, width, fill?}
+- shape {op_id, shape_id, kind: SHAPE_KINDS, p1, p2, color, width, fill?}
 - text {op_id, obj_id, x, y, text, size, color}
-- sticky {op_id, obj_id, x, y, text, color}
-- move_object / edit_object (stretch goal)
+- sticky {op_id, obj_id, x, y, text, color}; fixed 220x160 logical size;
+  text length 1..300; color one of the five sticky note colors.
+- edit_object {op_id, target_id, text}; text length 1..300; edits a sticky's
+  text. Last write wins by server seq.
+- move_object {op_id, target_id, x, y}; moves a sticky. Last write wins by
+  server seq.
 - delete_object {op_id, target_id} (object eraser)
 - clear_canvas {op_id} (host or permitted role only)
 - undo {op_id} / redo {op_id}
@@ -142,6 +146,9 @@ Example:
   no-op and the user is told.
 - clear_canvas by the host can itself be undone by the host (restore the
   cleared objects as one unit).
+- Undo and redo of sticky create, edit and move are per author. Undo restores
+  the previous text or position. If the sticky was deleted by someone else in
+  the meantime, undo is a no-op with a notice.
 - Undo and redo stacks are kept server-side per user so they survive a
   client restart within the session.
 
@@ -157,8 +164,15 @@ Example:
   and arrow kinds); p1 and p2 are [x, y] inside the canvas; width 1..50;
   color #rrggbb; fill is null or a #rrggbb color. Old kinds keep working so
   saved boards still load.
-- text: x, y inside the canvas; text length 1..500; size 8..72; color
-  #rrggbb.
+- sticky: obj_id string; x, y inside the canvas; text length 1..300; color one
+  of the five sticky note colors. The note has a fixed 220x160 logical size.
+- edit_object: op_id, target_id string; text length 1..300. Target must be an
+  existing sticky. Last write wins by server seq.
+- move_object: op_id, target_id string; x, y inside the canvas. Target must be
+  an existing sticky. Last write wins by server seq.
+- undo of create, edit or move of a sticky by its author restores the previous
+  state. If another user deleted the sticky in the meantime, undo is a no-op
+  and the caller is told "target already removed".
 - Sender must be a member with a role that allows the op (viewers cannot
   draw; only host can clear or change roles).
 - Rate limit per client (for example max ops per second) to prevent

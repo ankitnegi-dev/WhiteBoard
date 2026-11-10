@@ -512,10 +512,14 @@ class WhiteboardApp:
         tool_button("Pen", "pen")
         tool_button("Eraser", "eraser")
         tool_button("Text", "text")
-        self.select_btn = action_button(row1, "Select", lambda: None, "Coming soon", width=7)
-        self.select_btn.state(["disabled"])
-        self.sticky_btn = action_button(row1, "Sticky", lambda: None, "Coming soon", width=7)
-        self.sticky_btn.state(["disabled"])
+        self.select_btn = action_button(row1, "Select", lambda: self._set_tool("select"),
+                                        "Select and move objects", width=7)
+        self.sticky_btn = action_button(row1, "Sticky", lambda: self._set_tool("sticky"),
+                                        "Create sticky note", width=7)
+        self.tool_buttons["select"] = self.select_btn
+        self.tool_buttons["sticky"] = self.sticky_btn
+        self.tool_tooltips["select"] = self.select_btn._tooltip
+        self.tool_tooltips["sticky"] = self.sticky_btn._tooltip
 
         self._last_shape = "rectangle"
         self.shapes_btn = action_button(row1, "Shapes", self._activate_last_shape,
@@ -570,8 +574,7 @@ class WhiteboardApp:
         self.clear_btn = action_button(row2, "Clear", self._clear_canvas, "Host only")
         self.save_btn = action_button(row2, "Save", self._save_board, "Host only")
         self.load_btn = action_button(row2, "Load", self._load_board, "Host only")
-        self.export_btn = action_button(row2, "Export", lambda: None, "Coming soon", width=7)
-        self.export_btn.state(["disabled"])
+        self.export_btn = action_button(row2, "Export", self._export_board, "Export board as PNG", width=7)
         self.history_btn = action_button(row2, "History", lambda: None, "Coming soon", width=8)
         self.history_btn.state(["disabled"])
 
@@ -599,6 +602,7 @@ class WhiteboardApp:
         self.canvas.bind("<B1-Motion>", self._on_motion)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Motion>", self._on_hover)
+        self.canvas.bind("<Double-Button-1>", self._on_double_click)
 
         # Right panel.  A fixed width is what stops chat/participant content
         # from resizing the whole rail while someone is drawing.
@@ -778,6 +782,18 @@ class WhiteboardApp:
             tip = getattr(widget, "_tooltip", None)
             if tip is not None:
                 tip.set_text(reason if is_viewer else "Host only")
+        export = getattr(self, "export_btn", None)
+        if export is not None:
+            self._set_enabled(export, True)
+            tip = getattr(export, "_tooltip", None)
+            if tip is not None:
+                tip.set_text("Export board as PNG")
+        history = getattr(self, "history_btn", None)
+        if history is not None:
+            self._set_enabled(history, False)
+            tip = getattr(history, "_tooltip", None)
+            if tip is not None:
+                tip.set_text("Coming soon")
         self._update_host_buttons()
 
     def _set_tool(self, tool):
@@ -789,7 +805,7 @@ class WhiteboardApp:
             self._text_entry = None
         self.tool = tool
         self._highlight_erase_target(None)
-        active_key = tool if tool in ("pen", "eraser", "text") else "shape"
+        active_key = tool if tool in ("pen", "eraser", "text", "select", "sticky") else "shape"
         for t, btn in self.tool_buttons.items():
             btn.configure(style="ToolActive.TButton" if t == active_key else "Tool.TButton")
         if hasattr(self, "status_conn"):
@@ -1214,6 +1230,16 @@ class WhiteboardApp:
                 self.net.send(msg)
         elif self.tool == "eraser":
             self._erase_at(lx, ly)
+        elif self.tool == "sticky":
+            if not self._over_board(event.x, event.y):
+                return
+            lx, ly = self._to_logical(event.x, event.y)
+            self._place_sticky(lx, ly)
+        elif self.tool == "select":
+            if not self._over_board(event.x, event.y):
+                return
+            lx, ly = self._to_logical(event.x, event.y)
+            self._select_at(lx, ly)
         elif self.tool not in ("pen", "eraser", "text"):
             self._shape_start = (lx, ly)
             self._shape_kind = self.tool
@@ -1255,6 +1281,19 @@ class WhiteboardApp:
         elif self.tool == "eraser":
             # Hover highlight and sweep-to-erase.
             self._erase_at(lx, ly)
+        elif self.tool == "select":
+            if getattr(self, "_selected_sticky", None) is not None and getattr(self, "_drag_origin", None) is not None:
+                obj = self.state.objects.get(self._selected_sticky)
+                if isinstance(obj, dict):
+                    dx = lx - self._drag_start[0]
+                    dy = ly - self._drag_start[1]
+                    obj["x"] = self._drag_origin[0] + dx
+                    obj["y"] = self._drag_origin[1] + dy
+                    item = self.canvas_items.pop(self._selected_sticky, None)
+                    if item is not None:
+                        self.canvas.delete(item)
+                    self._add_sticky_item(obj)
+                    self._draw_selection()
         elif self.tool not in ("pen", "eraser", "text"):
             if self._shape_start is not None:
                 x0, y0 = self._shape_start
@@ -1284,6 +1323,9 @@ class WhiteboardApp:
         self.net.send(msg)
 
     def _erase_at(self, lx: float, ly: float) -> None:
+        if self._erase_sticky_at(lx, ly):
+            self._highlight_erase_target(None)
+            return
         sid = find_stroke_at(self.state.objects, lx, ly, threshold=self._erase_threshold())
         self._highlight_erase_target(sid)
         if not sid:
@@ -1303,6 +1345,16 @@ class WhiteboardApp:
         self._last_erased = sid
 
     def _on_release(self, event):
+        if self.tool == "select":
+            if getattr(self, "_selected_sticky", None) is not None and getattr(self, "_drag_origin", None) is not None:
+                obj = self.state.objects.get(self._selected_sticky)
+                if isinstance(obj, dict):
+                    self.net.send({"type": "move_object", "op_id": str(__import__("uuid").uuid4()),
+                                    "target_id": self._selected_sticky,
+                                    "x": obj.get("x"), "y": obj.get("y")})
+            self._drag_origin = None
+            self._drag_start = None
+            return
         if self.tool not in ("pen", "eraser", "text"):
             if self._shape_start is None:
                 return
@@ -1550,6 +1602,33 @@ class WhiteboardApp:
                 if isinstance(obj, dict):
                     self._add_text_item(obj)
                 return
+            if mtype == "sticky":
+                oid = msg.get("obj_id")
+                obj = self.state.objects.get(oid) if isinstance(oid, str) else None
+                if isinstance(obj, dict):
+                    self._add_sticky_item(obj)
+                return
+            if mtype == "edit_object":
+                tid = msg.get("target_id")
+                obj = self.state.objects.get(tid) if isinstance(tid, str) else None
+                if isinstance(obj, dict):
+                    obj["text"] = msg.get("text", obj.get("text", ""))
+                    item = self.canvas_items.pop(tid, None)
+                    if item is not None:
+                        self.canvas.delete(item)
+                    self._add_sticky_item(obj)
+                return
+            if mtype == "move_object":
+                tid = msg.get("target_id")
+                obj = self.state.objects.get(tid) if isinstance(tid, str) else None
+                if isinstance(obj, dict):
+                    obj["x"] = msg.get("x", obj.get("x", 0))
+                    obj["y"] = msg.get("y", obj.get("y", 0))
+                    item = self.canvas_items.pop(tid, None)
+                    if item is not None:
+                        self.canvas.delete(item)
+                    self._add_sticky_item(obj)
+                return
             # Render remote stroke updates.
             self._render_op(msg)
             return
@@ -1601,7 +1680,14 @@ class WhiteboardApp:
                 obj = msg.get("object")
                 if isinstance(obj, dict) and "id" in obj:
                     self.state.objects[obj["id"]] = obj
-                    self._add_stroke_item(obj)
+                    if obj.get("type") == "shape":
+                        self._add_shape_item(obj)
+                    elif obj.get("type") == "text":
+                        self._add_text_item(obj)
+                    elif obj.get("type") == "sticky":
+                        self._add_sticky_item(obj)
+                    else:
+                        self._add_stroke_item(obj)
             elif action == "restore_objects":
                 for obj in msg.get("objects", []):
                     if isinstance(obj, dict) and "id" in obj:
@@ -1627,8 +1713,31 @@ class WhiteboardApp:
                         self._add_shape_item(obj)
                     elif obj.get("type") == "text":
                         self._add_text_item(obj)
+                    elif obj.get("type") == "sticky":
+                        self._add_sticky_item(obj)
                     else:
                         self._add_stroke_item(obj)
+            elif action == "edit_object":
+                tid = msg.get("target_id")
+                obj = self.state.objects.get(tid) if isinstance(tid, str) else None
+                if isinstance(obj, dict) and "text" in msg:
+                    obj["text"] = msg.get("text")
+                    item = self.canvas_items.pop(tid, None)
+                    if item is not None:
+                        self.canvas.delete(item)
+                    self._add_sticky_item(obj)
+            elif action == "move_object":
+                tid = msg.get("target_id")
+                obj = self.state.objects.get(tid) if isinstance(tid, str) else None
+                if isinstance(obj, dict):
+                    if "x" in msg:
+                        obj["x"] = msg.get("x")
+                    if "y" in msg:
+                        obj["y"] = msg.get("y")
+                    item = self.canvas_items.pop(tid, None)
+                    if item is not None:
+                        self.canvas.delete(item)
+                    self._add_sticky_item(obj)
             return
         if mtype == "redo":
             action = msg.get("action")
@@ -1645,8 +1754,31 @@ class WhiteboardApp:
                         self._add_shape_item(obj)
                     elif obj.get("type") == "text":
                         self._add_text_item(obj)
+                    elif obj.get("type") == "sticky":
+                        self._add_sticky_item(obj)
                     else:
                         self._add_stroke_item(obj)
+            elif action == "edit_object":
+                tid = msg.get("target_id")
+                obj = self.state.objects.get(tid) if isinstance(tid, str) else None
+                if isinstance(obj, dict) and "text" in msg:
+                    obj["text"] = msg.get("text")
+                    item = self.canvas_items.pop(tid, None)
+                    if item is not None:
+                        self.canvas.delete(item)
+                    self._add_sticky_item(obj)
+            elif action == "move_object":
+                tid = msg.get("target_id")
+                obj = self.state.objects.get(tid) if isinstance(tid, str) else None
+                if isinstance(obj, dict):
+                    if "x" in msg:
+                        obj["x"] = msg.get("x")
+                    if "y" in msg:
+                        obj["y"] = msg.get("y")
+                    item = self.canvas_items.pop(tid, None)
+                    if item is not None:
+                        self.canvas.delete(item)
+                    self._add_sticky_item(obj)
             elif action == "remove_stroke":
                 tid = msg.get("target_id")
                 if isinstance(tid, str):
@@ -1800,6 +1932,345 @@ class WhiteboardApp:
                                        font=("Segoe UI", size), tags=(oid,))
         self.canvas_items[oid] = item
         self._raise_matte()
+
+    def _add_sticky_item(self, obj: dict[str, Any]) -> None:
+        sid = obj.get("id")
+        if not isinstance(sid, str) or sid in self.canvas_items:
+            return
+        x, y = self._to_window(float(obj.get("x", 0)), float(obj.get("y", 0)))
+        scale = self.scale
+        width = int(220 * scale)
+        height = int(160 * scale)
+        color = obj.get("color", "#FFF2A8")
+        text = str(obj.get("text", ""))
+        user = str(obj.get("user", ""))
+        # Shadow.
+        self.canvas.create_rectangle(x + 4, y + 4, x + width + 4, y + height + 4,
+                                    fill="#000000", outline="", stipple="gray25",
+                                    tags=(sid,))
+        item = self.canvas.create_rectangle(x, y, x + width, y + height,
+                                            fill=color, outline="#8A7F68", width=2,
+                                            tags=(sid,))
+        self.canvas_items[sid] = item
+        # Wrapped, clipped text.
+        import textwrap
+        lines = []
+        for line in text.splitlines():
+            lines.extend(textwrap.wrap(line, width=26) or [""])
+        lines = lines[:9]
+        body = "\n".join(lines)
+        self.canvas.create_text(x + 10, y + 10, text=body, fill="#2A2A2A",
+                                anchor="nw", width=width - 20,
+                                font=("Segoe UI", max(9, int(11 * scale))),
+                                tags=(sid,))
+        self.canvas.create_text(x + 10, y + height - 8, text=f"- {user}",
+                                fill="#555555", anchor="sw",
+                                font=("Segoe UI", max(8, int(9 * scale))),
+                                tags=(sid,))
+        self._raise_matte()
+
+    def _place_sticky(self, lx: float, ly: float) -> None:
+        if self.role == "viewer":
+            self._toast("Viewers cannot do this.")
+            return
+        import uuid
+        try:
+            from protocol import STICKY_COLORS
+        except Exception:
+            STICKY_COLORS = ("#FFF2A8",)
+        oid = str(uuid.uuid4())
+        op_id = str(uuid.uuid4())
+        color = STICKY_COLORS[0]
+        text = "Note"
+        msg = {"type": "sticky", "op_id": op_id, "obj_id": oid,
+               "x": lx, "y": ly, "text": text, "color": color}
+        obj = {"id": oid, "type": "sticky", "x": lx, "y": ly, "text": text,
+               "color": color, "width": 220, "height": 160, "user": self.username,
+               "seq": 0}
+        self.state.objects[oid] = obj
+        self._add_sticky_item(obj)
+        self.state.track_pending(op_id)
+        self._pending_ops[op_id] = msg
+        self.state.start_drawing(self.username)
+        self.state.end_drawing(self.username)
+        if self.net:
+            self.net.send(msg)
+        self._open_sticky_editor(oid)
+
+    def _select_at(self, lx: float, ly: float) -> None:
+        self.canvas.delete("sticky_selection")
+        self._selected_sticky = None
+        self._drag_start = None
+        self._drag_origin = None
+        for oid, obj in self.state.objects.items():
+            if obj.get("type") != "sticky":
+                continue
+            x = float(obj.get("x", 0))
+            y = float(obj.get("y", 0))
+            w = float(obj.get("width", 220))
+            h = float(obj.get("height", 160))
+            if x <= lx <= x + w and y <= ly <= y + h:
+                self._selected_sticky = oid
+                self._drag_start = (lx, ly)
+                self._drag_origin = (x, y)
+                self._draw_selection()
+                return
+
+    def _draw_selection(self) -> None:
+        self.canvas.delete("sticky_selection")
+        oid = getattr(self, "_selected_sticky", None)
+        obj = self.state.objects.get(oid) if isinstance(oid, str) else None
+        if not isinstance(obj, dict):
+            return
+        x, y = self._to_window(float(obj.get("x", 0)), float(obj.get("y", 0)))
+        scale = self.scale
+        w = int(220 * scale)
+        h = int(160 * scale)
+        self.canvas.create_rectangle(x - 3, y - 3, x + w + 3, y + h + 3,
+                                    outline=self.theme["accent"], width=2,
+                                    dash=(4, 4), tags=("sticky_selection",))
+        self._raise_matte()
+
+    def _on_double_click(self, event) -> None:
+        if not self._over_board(event.x, event.y):
+            return
+        lx, ly = self._to_logical(event.x, event.y)
+        for oid, obj in self.state.objects.items():
+            if obj.get("type") != "sticky":
+                continue
+            x = float(obj.get("x", 0))
+            y = float(obj.get("y", 0))
+            w = float(obj.get("width", 220))
+            h = float(obj.get("height", 160))
+            if x <= lx <= x + w and y <= ly <= y + h:
+                self._open_sticky_editor(oid)
+                return
+
+    def _open_sticky_editor(self, oid: str) -> None:
+        if self.role == "viewer":
+            self._toast("Viewers cannot do this.")
+            return
+        obj = self.state.objects.get(oid)
+        if not isinstance(obj, dict):
+            return
+        if getattr(self, "_sticky_editor", None) is not None:
+            try:
+                self._sticky_editor.destroy()
+            except tk.TclError:
+                pass
+            self._sticky_editor = None
+        x, y = self._to_window(float(obj.get("x", 0)), float(obj.get("y", 0)))
+        scale = self.scale
+        width = int(220 * scale)
+        height = int(160 * scale)
+        t = self.theme
+        entry = tk.Text(self.canvas, wrap="word", bg=t["surface"], fg=t["ink"],
+                        insertbackground=t["ink"], selectbackground=t["accent"],
+                        selectforeground=t["on_accent"], borderwidth=1, relief="solid",
+                        font=("Segoe UI", max(9, int(11 * scale))))
+        entry.place(x=x + 8, y=y + 8, width=max(40, width - 16),
+                   height=max(20, height - 28))
+        entry.insert("1.0", str(obj.get("text", "")))
+        entry.focus_set()
+        self._sticky_editor = entry
+
+        def commit(event=None):
+            if not entry.winfo_exists():
+                return "break"
+            new_text = entry.get("1.0", "end-1c").strip() or "Note"
+            entry.destroy()
+            self._sticky_editor = None
+            if new_text == obj.get("text", ""):
+                return "break"
+            op_id = str(__import__("uuid").uuid4())
+            msg = {"type": "edit_object", "op_id": op_id, "target_id": oid,
+                   "text": new_text}
+            obj["text"] = new_text
+            item = self.canvas_items.pop(oid, None)
+            if item is not None:
+                self.canvas.delete(item)
+            self._add_sticky_item(obj)
+            self.state.track_pending(op_id)
+            self._pending_ops[op_id] = msg
+            if self.net:
+                self.net.send(msg)
+            return "break"
+
+        def cancel(event=None):
+            if entry.winfo_exists():
+                entry.destroy()
+            self._sticky_editor = None
+            return "break"
+
+        entry.bind("<Escape>", cancel)
+        entry.bind("<Control-Return>", commit)
+        entry.bind("<FocusOut>", lambda e: commit() if entry.winfo_exists() else None)
+
+    def _export_board(self, path: Optional[str] = None, scale: int = 1) -> None:
+        import os
+        import time
+        from tkinter import filedialog
+
+        if path is None:
+            default_name = f"whiteboard-{self.room_code or 'board'}-{int(time.time())}.png"
+            path = filedialog.asksaveasfilename(
+                title="Export board as PNG",
+                defaultextension=".png",
+                initialfile=default_name,
+                filetypes=[("PNG image", "*.png"), ("All files", "*.*")],
+            )
+        if not path:
+            return
+        scale = 2 if scale == 2 else 1
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except Exception:
+            try:
+                self.canvas.postscript(file=path, colormode="color")
+            except Exception as exc:
+                self._toast(f"Export failed: {exc}")
+                return
+            self._toast("Pillow is not installed; exported PostScript instead of PNG.")
+            return
+
+        width, height = 1600, 900
+        image = Image.new("RGB", (width * scale, height * scale), "#FBF8F1")
+        draw = ImageDraw.Draw(image)
+
+        def sx(v):
+            return float(v) * scale
+
+        def sy(v):
+            return float(v) * scale
+
+        def font(size, bold=False):
+            candidates = []
+            if os.name == "nt":
+                candidates.extend([
+                    r"C:\Windows\Fonts\segoeui.ttf",
+                    r"C:\Windows\Fonts\arial.ttf",
+                    r"C:\Windows\Fonts\tahoma.ttf",
+                ])
+            else:
+                candidates.extend([
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                ])
+            for candidate in candidates:
+                try:
+                    return ImageFont.truetype(candidate, max(1, size * scale))
+                except Exception:
+                    continue
+            return ImageFont.load_default()
+
+        # Strokes.
+        for obj in self.state.objects.values():
+            if obj.get("type") != "stroke":
+                continue
+            pts = obj.get("points", [])
+            if not isinstance(pts, list) or not pts:
+                continue
+            color = obj.get("color", "#000000")
+            line_width = max(1, int(float(obj.get("width", 2)) * scale))
+            coords = [(sx(p[0]), sy(p[1])) for p in pts
+                      if isinstance(p, (list, tuple)) and len(p) == 2]
+            if len(coords) == 1:
+                x, y = coords[0]
+                r = max(1, line_width // 2)
+                draw.ellipse((x - r, y - r, x + r, y + r), fill=color)
+            elif len(coords) >= 2:
+                draw.line(coords, fill=color, width=line_width, joint="curve")
+
+        # Shapes through the shared geometry module.
+        try:
+            import shapes_geometry as sg
+        except Exception:
+            sg = None
+        for obj in self.state.objects.values():
+            if obj.get("type") != "shape":
+                continue
+            kind = obj.get("kind", "rectangle")
+            try:
+                p1 = obj.get("p1", [0, 0])
+                p2 = obj.get("p2", [0, 0])
+                if sg is not None:
+                    pts = sg.shape_points(kind, float(p1[0]), float(p1[1]),
+                                          float(p2[0]), float(p2[1]))
+                else:
+                    pts = [(float(p1[0]), float(p1[1])),
+                            (float(p2[0]), float(p2[1]))]
+            except Exception:
+                pts = []
+            if not pts:
+                continue
+            coords = [(sx(p[0]), sy(p[1])) for p in pts]
+            color = obj.get("color", "#000000")
+            line_width = max(1, int(float(obj.get("width", 2)) * scale))
+            fill = obj.get("fill")
+            if kind in ("line", "arrow", "double_arrow"):
+                if len(coords) >= 2:
+                    draw.line(coords, fill=color, width=line_width)
+            else:
+                if fill:
+                    try:
+                        draw.polygon(coords, fill=fill, outline=color, width=line_width)
+                    except TypeError:
+                        draw.polygon(coords, fill=fill, outline=color)
+                else:
+                    try:
+                        draw.polygon(coords, outline=color, width=line_width)
+                    except TypeError:
+                        draw.line(coords + [coords[0]], fill=color, width=line_width)
+
+        # Text.
+        for obj in self.state.objects.values():
+            if obj.get("type") != "text":
+                continue
+            x = sx(obj.get("x", 0))
+            y = sy(obj.get("y", 0))
+            size = max(8, int(float(obj.get("size", 12)) * scale))
+            draw.text((x, y), str(obj.get("text", "")), fill=obj.get("color", "#000000"),
+                      font=font(size))
+
+        # Stickies.
+        for obj in self.state.objects.values():
+            if obj.get("type") != "sticky":
+                continue
+            x = sx(obj.get("x", 0))
+            y = sy(obj.get("y", 0))
+            w = sx(obj.get("width", 220))
+            h = sy(obj.get("height", 160))
+            draw.rectangle((x, y, x + w, y + h), fill=obj.get("color", "#FFF2A8"),
+                           outline="#8A7F68", width=max(1, 2 * scale))
+            body_font = font(11)
+            lines = str(obj.get("text", "")).splitlines() or [""]
+            ty = y + 10 * scale
+            for line in lines[:9]:
+                draw.text((x + 10 * scale, ty), line, fill="#2A2A2A", font=body_font)
+                ty += 14 * scale
+            draw.text((x + 10 * scale, y + h - 8 * scale),
+                      f"- {obj.get('user', '')}", fill="#555555",
+                      font=font(9), anchor="ls")
+
+        image.save(path)
+        self._toast(f"Exported {os.path.basename(path)}")
+
+    def _erase_sticky_at(self, lx: float, ly: float) -> bool:
+        for oid, obj in list(self.state.objects.items()):
+            if obj.get("type") != "sticky":
+                continue
+            x = float(obj.get("x", 0))
+            y = float(obj.get("y", 0))
+            w = float(obj.get("width", 220))
+            h = float(obj.get("height", 160))
+            if x <= lx <= x + w and y <= ly <= y + h:
+                if self.net and oid != getattr(self, "_last_erased", None):
+                    self.net.send({"type": "delete_object", "op_id": str(__import__("uuid").uuid4()),
+                                    "target_id": oid})
+                    self._last_erased = oid
+                return True
+        return False
 
     def _update_shape_preview(self, x0, y0, x1, y1, state):
         self._clear_shape_preview()
@@ -1958,6 +2429,8 @@ class WhiteboardApp:
                 self._add_shape_item(obj)
             elif otype == "text":
                 self._add_text_item(obj)
+            elif otype == "sticky":
+                self._add_sticky_item(obj)
         self.canvas.tag_raise("matte")
         if self.debug_overlay:
             self._raise_debug_overlay()

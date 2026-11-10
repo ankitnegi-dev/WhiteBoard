@@ -26,6 +26,14 @@ from typing import Any, Dict
 # later milestone) will raise this or use a chunked path.
 MAX_MESSAGE_SIZE: int = 1 * 1024 * 1024
 
+# Sticky notes have a fixed logical size and five preset colors.
+STICKY_WIDTH: int = 220
+STICKY_HEIGHT: int = 160
+STICKY_COLORS: tuple[str, ...] = (
+    "#FFF2A8", "#FFD6A5", "#FDFFB6", "#CAFFBF", "#A0C4FF",
+)
+MAX_STICKY_TEXT: int = 300
+
 # Whitelist of shape kinds accepted by the server. Old kinds (line, rect,
 # ellipse, arrow) are kept so saved boards still load.
 SHAPE_KINDS: tuple[str, ...] = (
