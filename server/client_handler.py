@@ -275,7 +275,8 @@ def handle_client(
                         exclude=state["username"],
                     )
                 continue
-            elif mtype in ("stroke_start", "stroke_points", "stroke_end", "delete_object"):
+            elif mtype in ("stroke_start", "stroke_points", "stroke_end", "delete_object",
+                           "shape", "text"):
                 status, op, reason = room.apply_op(msg, state["username"], state["role"])
                 if status == "duplicate":
                     continue

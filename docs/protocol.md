@@ -152,6 +152,13 @@ Example:
 - Coordinates inside the logical canvas (0..1600 by 0..900); width between
   1 and 50; color as #rrggbb; text length <= 500; point batch <= 500;
   chat text <= 500.
+- shape: kind is one of the SHAPE_KINDS whitelist defined in protocol.py
+  (basic, flowchart and callout shapes, plus the legacy line, rect, ellipse
+  and arrow kinds); p1 and p2 are [x, y] inside the canvas; width 1..50;
+  color #rrggbb; fill is null or a #rrggbb color. Old kinds keep working so
+  saved boards still load.
+- text: x, y inside the canvas; text length 1..500; size 8..72; color
+  #rrggbb.
 - Sender must be a member with a role that allows the op (viewers cannot
   draw; only host can clear or change roles).
 - Rate limit per client (for example max ops per second) to prevent

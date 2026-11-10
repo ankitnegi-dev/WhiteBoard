@@ -31,6 +31,7 @@ from client.tools import (
     find_stroke_at,
     is_inside_board,
     logical_to_window,
+    shift_constraint,
     window_to_logical,
 )
 
@@ -85,7 +86,7 @@ class WhiteboardApp:
         self.root.report_callback_exception = self._report_exception
         self.root.title("LAN Collaborative Whiteboard")
         self.root.geometry("1280x800")
-        self.root.minsize(1100, 700)
+        self.root.minsize(1280, 720)
 
         self.theme_name = "light"
         self.theme = LIGHT
@@ -104,6 +105,13 @@ class WhiteboardApp:
         self._reconnect_after_id: Optional[str] = None
         self._pending_ops: dict[str, dict[str, Any]] = {}
         self._sync_state: str = "synced"
+        self._resync_pending: bool = False
+        self._ui_error_counts: dict[tuple, int] = {}
+        self._ui_error_last_full: dict[tuple, float] = {}
+        self._ui_error_last_summary: float = 0.0
+        self._ui_error_last_toast: float = 0.0
+        self._UI_ERROR_LOG_INTERVAL: float = 5.0
+        self._UI_ERROR_TOAST_INTERVAL: float = 5.0
 
         # Drawing state.
         self.tool = "pen"
@@ -111,8 +119,14 @@ class WhiteboardApp:
         self.user_color = "#1E5B6B"
         self.width = 2.0
         self.canvas_items: dict[str, int] = {}   # stroke_id -> canvas item id
-        self.cursor_items: dict[str, int] = {}   # username -> marker item
+        self.cursor_items: dict[str, Any] = {}   # username -> (oval, text)
+        self._cursor_last: dict[str, float] = {}
         self.local_strokes: dict[str, dict[str, Any]] = {}
+        self._shape_start = None
+        self._shape_kind = None
+        self._shape_preview = None
+        self._text_entry = None
+        self._text_pos = None
         self._last_cursor_send = 0.0
         self._blink = False
         self._last_ping_time = 0.0
@@ -425,6 +439,8 @@ class WhiteboardApp:
         self._reconnecting = False
         self._reconnect_backoff = 1.0
         self._sync_state = "synced"
+        self._resync_pending = False
+        self.state.behind_since = None
         self.root.after(10, self._poll)
 
     def _return_to_connect(self, message: str) -> None:
@@ -460,58 +476,114 @@ class WhiteboardApp:
         self.reconnect_banner.pack(side="top", fill="x")
         self.reconnect_banner.pack_forget()
 
-        # Left toolbar.
-        self.toolbar = ttk.Frame(self.main_frame, width=72, padding=8)
-        self.toolbar.pack(side="left", fill="y")
-        self.toolbar.pack_propagate(False)
+        # Top toolbar (two rows). No scrolling; fixed layout.
+        self.toolbar = ttk.Frame(self.main_frame, padding=(8, 4))
+        self.toolbar.pack(side="top", fill="x")
+        self.toolbar_row1 = ttk.Frame(self.toolbar)
+        self.toolbar_row1.pack(fill="x", pady=2)
+        self.toolbar_row2 = ttk.Frame(self.toolbar)
+        self.toolbar_row2.pack(fill="x", pady=2)
+        row1 = self.toolbar_row1
+        row2 = self.toolbar_row2
 
         self.tool_buttons = {}
-        self._tool_button("Pen", "pen")
-        self._tool_button("Eraser", "eraser")
-        ttk.Separator(self.toolbar, orient="horizontal").pack(fill="x", pady=8)
+        self.tool_tooltips = {}
+        button_pad = (8, 7)
 
-        self.color_btn = ttk.Button(self.toolbar, text="Color", command=self._pick_color, style="Tool.TButton")
-        self.color_btn.pack(fill="x", pady=4)
-        self.color_swatch = tk.Label(self.toolbar, text="  ", bg=self.color, width=4, relief="solid", borderwidth=1)
-        self.color_swatch.pack(pady=4)
+        def action_button(parent, text, command, tip, width=None):
+            """Create one fixed-height toolbar button sized from its content."""
+            b = ttk.Button(parent, text=text, command=command,
+                           style="Tool.TButton", padding=button_pad)
+            if width is None:
+                width = max(5, len(text) + 2)
+            b.configure(width=width)
+            b.pack(side="left", padx=2)
+            Tooltip(b, tip)
+            return b
 
-        ttk.Label(self.toolbar, text="Width", font=("Segoe UI", 9)).pack(pady=(8, 0))
-        width_row = ttk.Frame(self.toolbar)
-        width_row.pack(fill="x", pady=2)
-        self.width_scale = ttk.Scale(width_row, from_=1, to=20, orient="horizontal", command=self._on_width)
+        def tool_button(label, tool):
+            b = action_button(row1, label, lambda: self._set_tool(tool),
+                              f"Select {label.lower()} tool")
+            self.tool_buttons[tool] = b
+            self.tool_tooltips[tool] = b._tooltip
+            return b
+
+        # Row 1: tools, shapes, style.
+        tool_button("Pen", "pen")
+        tool_button("Eraser", "eraser")
+        tool_button("Text", "text")
+        self.select_btn = action_button(row1, "Select", lambda: None, "Coming soon", width=7)
+        self.select_btn.state(["disabled"])
+        self.sticky_btn = action_button(row1, "Sticky", lambda: None, "Coming soon", width=7)
+        self.sticky_btn.state(["disabled"])
+
+        self._last_shape = "rectangle"
+        self.shapes_btn = action_button(row1, "Shapes", self._activate_last_shape,
+                                        "Use the last shape", width=9)
+        self.shapes_btn.pack_configure(padx=(2, 0))
+        self.shapes_arrow_btn = ttk.Button(row1, text="\u25BE",
+                                           command=self._open_shapes_palette,
+                                           style="Tool.TButton", padding=(4, 7),
+                                           width=2)
+        self.shapes_arrow_btn.pack(side="left", padx=(0, 2))
+        Tooltip(self.shapes_arrow_btn, "Open shapes palette")
+        self.tool_buttons["shape"] = self.shapes_btn
+        self.tool_tooltips["shape"] = self.shapes_btn._tooltip
+        self._update_shapes_button_icon()
+
+        ttk.Separator(row1, orient="vertical").pack(side="left", fill="y", padx=6)
+
+        self.color_btn = action_button(row1, "Color", self._pick_color, "Pick color")
+        self.color_swatch = tk.Label(row1, text="", bg=self.color, width=3,
+                                     relief="solid", borderwidth=1, cursor="hand2")
+        self.color_swatch.pack(side="left", padx=2)
+        self.color_swatch.bind("<Button-1>", lambda _e: self._pick_color())
+        Tooltip(self.color_swatch, "Color swatch")
+
+        ttk.Label(row1, text="Width").pack(side="left", padx=(6, 2))
+        self.width_scale = ttk.Scale(row1, from_=1, to=20, orient="horizontal",
+                                     command=self._on_width, length=120)
         self.width_scale.set(self.width)
-        self.width_scale.pack(side="left", fill="x", expand=True)
-        self.width_value = ttk.Label(width_row, text=f"{int(self.width)}", width=3)
-        self.width_value.pack(side="left", padx=4)
-        self.width_preview = tk.Canvas(self.toolbar, width=56, height=20, highlightthickness=0)
-        self.width_preview.pack(pady=2)
+        self.width_scale.pack(side="left", padx=2)
+        self.width_value = ttk.Label(row1, text=f"{int(self.width)}", width=3)
+        self.width_value.pack(side="left", padx=2)
+        self.width_preview = tk.Canvas(row1, width=40, height=24, highlightthickness=0)
+        self.width_preview.pack(side="left", padx=2)
         self._update_width_preview()
 
-        ttk.Separator(self.toolbar, orient="horizontal").pack(fill="x", pady=8)
-        self.undo_btn = ttk.Button(self.toolbar, text="Undo", command=self._undo)
-        self.undo_btn.pack(fill="x", pady=2)
-        Tooltip(self.undo_btn, "Undo your last action")
-        self.redo_btn = ttk.Button(self.toolbar, text="Redo", command=self._redo)
-        self.redo_btn.pack(fill="x", pady=2)
-        Tooltip(self.redo_btn, "Redo your last action")
-        self.clear_btn = ttk.Button(self.toolbar, text="Clear", command=self._clear_canvas)
-        self.clear_btn.pack(fill="x", pady=2)
-        Tooltip(self.clear_btn, "Host only")
-        self.save_btn = ttk.Button(self.toolbar, text="Save", command=self._save_board)
-        self.save_btn.pack(fill="x", pady=2)
-        Tooltip(self.save_btn, "Host only")
-        self.load_btn = ttk.Button(self.toolbar, text="Load", command=self._load_board)
-        self.load_btn.pack(fill="x", pady=2)
-        Tooltip(self.load_btn, "Host only")
+        self.fill_var = tk.BooleanVar(value=False)
+        self.fill_btn = action_button(row1, "Fill", self._toggle_fill,
+                                      "Fill closed shapes", width=6)
+        self.fill_btn.pack_configure(padx=(8, 2))
+
+        ttk.Label(row1, text="Text size").pack(side="left", padx=(6, 2))
+        self.text_size = ttk.Combobox(row1, values=["10", "12", "16", "20", "24", "32"], width=5)
+        self.text_size.set("16")
+        self.text_size.pack(side="left", padx=2)
+
+        # Row 2: edit and file.
+        self.undo_btn = action_button(row2, "Undo", self._undo, "Undo your last action")
+        self.redo_btn = action_button(row2, "Redo", self._redo, "Redo your last action")
+
+        ttk.Separator(row2, orient="vertical").pack(side="left", fill="y", padx=6)
+
+        self.clear_btn = action_button(row2, "Clear", self._clear_canvas, "Host only")
+        self.save_btn = action_button(row2, "Save", self._save_board, "Host only")
+        self.load_btn = action_button(row2, "Load", self._load_board, "Host only")
+        self.export_btn = action_button(row2, "Export", lambda: None, "Coming soon", width=7)
+        self.export_btn.state(["disabled"])
+        self.history_btn = action_button(row2, "History", lambda: None, "Coming soon", width=8)
+        self.history_btn.state(["disabled"])
+
+        # Reserved room for Export and History; those buttons arrive later.
+        self.file_reserved = ttk.Frame(row2, width=170, height=34)
+        self.file_reserved.pack(side="left", padx=(10, 2))
+        self.file_reserved.pack_propagate(False)
 
         if self.role != "host":
             self.clear_btn.state(["disabled"])
             self.save_btn.state(["disabled"])
             self.load_btn.state(["disabled"])
-
-        ttk.Separator(self.toolbar, orient="horizontal").pack(fill="x", pady=8)
-        self.theme_btn = ttk.Button(self.toolbar, text="Theme", command=self._toggle_theme)
-        self.theme_btn.pack(fill="x", pady=4)
 
         # Center canvas.  The pack padding is outside the widget, so event
         # coordinates never include it; only the widget border and highlight
@@ -537,13 +609,26 @@ class WhiteboardApp:
         # Identity chip.
         self.identity_frame = ttk.Frame(self.right, padding=6, relief="solid", borderwidth=1)
         self.identity_frame.pack(fill="x", pady=(0, 8))
-        self.identity_dot = tk.Canvas(self.identity_frame, width=14, height=14, highlightthickness=0, bg=self.theme["bg"])
+        identity_top = ttk.Frame(self.identity_frame)
+        identity_top.pack(fill="x")
+        self.identity_dot = tk.Canvas(identity_top, width=14, height=14, highlightthickness=0, bg=self.theme["bg"])
         self.identity_dot.pack(side="left", padx=(0, 6))
         self.identity_dot.create_oval(2, 2, 12, 12, fill=self.user_color, outline="", tags=("dot",))
-        self.identity_name = ttk.Label(self.identity_frame, text=self.username, font=("Segoe UI", 11, "bold"))
+        self.identity_name = ttk.Label(identity_top, text=self.username, font=("Segoe UI", 11, "bold"))
         self.identity_name.pack(side="left")
-        self.identity_role = ttk.Label(self.identity_frame, text=self.role, font=("Segoe UI", 9))
+        self.identity_role = ttk.Label(identity_top, text=self.role, font=("Segoe UI", 9))
         self.identity_role.pack(side="left", padx=6)
+        identity_toggles = ttk.Frame(self.identity_frame)
+        identity_toggles.pack(fill="x", pady=(4, 0))
+        self.show_cursors_var = tk.BooleanVar(value=True)
+        self.show_cursors_btn = ttk.Checkbutton(identity_toggles, text="Show cursors",
+                                                variable=self.show_cursors_var,
+                                                command=self._toggle_cursors)
+        self.show_cursors_btn.pack(side="left")
+        Tooltip(self.show_cursors_btn, "Show or hide remote cursors")
+        self.theme_btn = ttk.Button(identity_toggles, text="Theme", command=self._toggle_theme)
+        self.theme_btn.pack(side="right")
+        Tooltip(self.theme_btn, "Switch light and dark theme")
 
         room_header = ttk.Frame(self.right)
         room_header.pack(fill="x", pady=(0, 8))
@@ -557,16 +642,6 @@ class WhiteboardApp:
         ttk.Label(self.right, text="Participants", font=("Segoe UI", 11, "bold")).pack(anchor="w")
         self.participants_frame = ttk.Frame(self.right)
         self.participants_frame.pack(fill="x", pady=(4, 8))
-
-        ttk.Label(self.right, text="Chat", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        self.chat_text = tk.Text(self.right, height=16, state="disabled", wrap="word", font=("Segoe UI", 10))
-        self.chat_text.pack(fill="both", expand=True, pady=4)
-        chat_input = ttk.Frame(self.right)
-        chat_input.pack(fill="x")
-        self.chat_entry = ttk.Entry(chat_input)
-        self.chat_entry.pack(side="left", fill="x", expand=True)
-        self.chat_entry.bind("<Return>", lambda _e: self._send_chat())
-        ttk.Button(chat_input, text="Send", command=self._send_chat).pack(side="left", padx=4)
 
         if self.role == "host":
             ttk.Separator(self.right, orient="horizontal").pack(fill="x", pady=8)
@@ -591,6 +666,21 @@ class WhiteboardApp:
             self.kick_btn.state(["disabled"])
             self.lock_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(hc, text="Lock room", variable=self.lock_var, command=self._toggle_lock).grid(row=4, column=0, columnspan=2, sticky="w")
+
+        # Chat takes the remaining vertical space; the input is reserved at
+        # the bottom first so it stays visible at the minimum window height.
+        ttk.Label(self.right, text="Chat", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        chat_input = ttk.Frame(self.right)
+        chat_input.pack(side="bottom", fill="x")
+        self.chat_entry = ttk.Entry(chat_input)
+        self.chat_entry.pack(side="left", fill="x", expand=True)
+        self.chat_entry.bind("<Return>", lambda _e: self._send_chat())
+        ttk.Button(chat_input, text="Send", command=self._send_chat).pack(side="left", padx=4)
+        self.chat_text = tk.Text(self.right, height=10, state="disabled", wrap="word",
+                                 font=("Segoe UI", 10), padx=6, pady=6, borderwidth=0,
+                                 highlightthickness=1,
+                                 highlightbackground=self.theme["border"])
+        self.chat_text.pack(fill="both", expand=True, pady=4)
 
         # Status bar.  Fixed character widths keep changing values (latency,
         # seq, activity) from shoving the neighbouring labels around.
@@ -626,13 +716,6 @@ class WhiteboardApp:
 
         self._update_permissions()
 
-    def _tool_button(self, label, tool):
-        btn = ttk.Button(self.toolbar, text=label, command=lambda: self._set_tool(tool), style="Tool.TButton")
-        btn.pack(fill="x", pady=4)
-        self.tool_buttons[tool] = btn
-        self.tool_tooltips = getattr(self, "tool_tooltips", {})
-        self.tool_tooltips[tool] = Tooltip(btn, f"Select {label.lower()} tool")
-
     def _set_enabled(self, widget, enabled: bool) -> None:
         if widget is None:
             return
@@ -650,38 +733,165 @@ class WhiteboardApp:
         is_viewer = self.role == "viewer"
         is_host = self.role == "host"
         reason = "Viewers cannot do this" if is_viewer else "Host only"
+        active_key = self.tool if self.tool in ("pen", "eraser", "text") else "shape"
+        for tool, btn in getattr(self, "tool_buttons", {}).items():
+            self._set_enabled(btn, not is_viewer)
+            if is_viewer:
+                btn.configure(style="Tool.TButton")
+            else:
+                btn.configure(style="ToolActive.TButton" if tool == active_key else "Tool.TButton")
+            tip = getattr(self, "tool_tooltips", {}).get(tool)
+            if tip is not None:
+                if is_viewer:
+                    tip.set_text(reason)
+                elif tool == "shape":
+                    tip.set_text(f"Use last shape: {self._last_shape.replace('_', ' ')}")
+                else:
+                    tip.set_text(f"Select {tool.lower()} tool")
+        arrow = getattr(self, "shapes_arrow_btn", None)
+        if arrow is not None:
+            self._set_enabled(arrow, not is_viewer)
+            tip = getattr(arrow, "_tooltip", None)
+            if tip is not None:
+                tip.set_text(reason if is_viewer else "Open shapes palette")
+        fill = getattr(self, "fill_btn", None)
+        if fill is not None:
+            self._set_enabled(fill, not is_viewer)
+            selected = bool(self.fill_var.get()) and not is_viewer
+            fill.configure(style="ToolActive.TButton" if selected else "Tool.TButton")
+            tip = getattr(fill, "_tooltip", None)
+            if tip is not None:
+                tip.set_text(reason if is_viewer else "Fill closed shapes")
         for name in ("undo_btn", "redo_btn"):
             widget = getattr(self, name, None)
             self._set_enabled(widget, not is_viewer)
+            tip = getattr(widget, "_tooltip", None)
+            if tip is not None:
+                if is_viewer:
+                    tip.set_text(reason)
+                else:
+                    tip.set_text("Undo your last action" if name == "undo_btn"
+                                 else "Redo your last action")
         for name in ("clear_btn", "save_btn", "load_btn"):
             widget = getattr(self, name, None)
             self._set_enabled(widget, is_host)
-        for tool, btn in getattr(self, "tool_buttons", {}).items():
-            self._set_enabled(btn, not is_viewer)
-            tip = getattr(self, "tool_tooltips", {}).get(tool)
+            tip = getattr(widget, "_tooltip", None)
             if tip is not None:
-                tip.set_text(reason if is_viewer else f"Select {tool.lower()} tool")
-        if is_viewer:
-            for name in ("undo_btn", "redo_btn", "clear_btn", "save_btn", "load_btn"):
-                widget = getattr(self, name, None)
-                tip = getattr(widget, "_tooltip", None)
-                if tip is not None:
-                    tip.set_text(reason)
-        else:
-            for name in ("clear_btn", "save_btn", "load_btn"):
-                widget = getattr(self, name, None)
-                tip = getattr(widget, "_tooltip", None)
-                if tip is not None:
-                    tip.set_text("Host only")
+                tip.set_text(reason if is_viewer else "Host only")
         self._update_host_buttons()
 
     def _set_tool(self, tool):
+        if getattr(self, "_text_entry", None) is not None:
+            try:
+                self._text_entry.destroy()
+            except tk.TclError:
+                pass
+            self._text_entry = None
         self.tool = tool
         self._highlight_erase_target(None)
+        active_key = tool if tool in ("pen", "eraser", "text") else "shape"
         for t, btn in self.tool_buttons.items():
-            btn.configure(style="ToolActive.TButton" if t == tool else "Tool.TButton")
+            btn.configure(style="ToolActive.TButton" if t == active_key else "Tool.TButton")
         if hasattr(self, "status_conn"):
-            self.status_conn.config(text=f"Tool: {tool}")
+            self.status_conn.config(text=f"Tool: {tool.replace('_', ' ')}")
+
+    def _activate_last_shape(self):
+        self._select_shape(self._last_shape)
+
+    def _toggle_fill(self):
+        if self.role == "viewer":
+            return
+        self.fill_var.set(not self.fill_var.get())
+        self.fill_btn.configure(style="ToolActive.TButton" if self.fill_var.get()
+                                else "Tool.TButton")
+        tip = getattr(self.fill_btn, "_tooltip", None)
+        if tip is not None:
+            tip.set_text("Fill closed shapes: on" if self.fill_var.get()
+                         else "Fill closed shapes: off")
+
+    def _shape_icon_photo(self, kind, color, size=16):
+        """Rasterize one shape kind into a small PhotoImage icon."""
+        try:
+            import shapes_geometry as sg
+            pts = sg.shape_points(kind, 2.0, 2.0, size - 3.0, size - 3.0)
+        except Exception:
+            pts = [(2, 2), (size - 3, 2), (size - 3, size - 3),
+                   (2, size - 3), (2, 2)]
+        image = tk.PhotoImage(master=self.root, width=size, height=size)
+        for index in range(len(pts) - 1):
+            x1, y1 = pts[index]
+            x2, y2 = pts[index + 1]
+            steps = max(1, int(round(max(abs(x2 - x1), abs(y2 - y1)))))
+            for step in range(steps + 1):
+                t = step / steps
+                px = int(round(x1 + (x2 - x1) * t))
+                py = int(round(y1 + (y2 - y1) * t))
+                if 0 <= px < size and 0 <= py < size:
+                    image.put(color, (px, py))
+        return image
+
+    def _update_shapes_button_icon(self):
+        if not hasattr(self, "shapes_btn"):
+            return
+        self._shape_icon = self._shape_icon_photo(self._last_shape, self.theme["ink"], 16)
+        self.shapes_btn.configure(image=self._shape_icon, compound="left", text="Shapes")
+        tip = getattr(self.shapes_btn, "_tooltip", None)
+        if tip is not None and self.role != "viewer":
+            tip.set_text(f"Use last shape: {self._last_shape.replace('_', ' ')}")
+
+    def _close_shapes_palette(self):
+        palette = getattr(self, "_shapes_palette", None)
+        self._shapes_palette = None
+        if palette is not None:
+            try:
+                palette.destroy()
+            except tk.TclError:
+                pass
+
+    def _open_shapes_palette(self):
+        self._close_shapes_palette()
+        palette = tk.Toplevel(self.root)
+        palette.title("Shapes")
+        palette.transient(self.root)
+        palette.resizable(False, False)
+        palette.configure(bg=self.theme["bg"])
+        groups = [
+            ("Basic", ["line", "arrow", "double_arrow", "rectangle",
+                       "rounded_rectangle", "ellipse", "triangle", "right_triangle",
+                       "diamond", "pentagon", "hexagon", "star", "plus", "heart"]),
+            ("Flowchart", ["process", "decision", "terminator", "data", "document"]),
+            ("Callout", ["speech_bubble"]),
+        ]
+        icons = []
+        grid_row = 0
+        for title, kinds in groups:
+            ttk.Label(palette, text=title, font=("Segoe UI", 9, "bold")).grid(
+                row=grid_row, column=0, columnspan=5, sticky="w", padx=8, pady=(8, 2))
+            grid_row += 1
+            for index, kind in enumerate(kinds):
+                col = index % 5
+                row = grid_row + index // 5
+                icon = self._shape_icon_photo(kind, self.theme["ink"], 24)
+                icons.append(icon)
+                label = kind.replace("_", " ")
+                btn = ttk.Button(palette, text=label, image=icon, compound="top",
+                                 command=lambda k=kind: self._select_shape(k))
+                btn.grid(row=row, column=col, padx=3, pady=3, sticky="ew")
+            grid_row += (len(kinds) + 4) // 5
+        palette._shape_icons = icons
+        palette.bind("<Escape>", lambda _e: self._close_shapes_palette())
+        palette.protocol("WM_DELETE_WINDOW", self._close_shapes_palette)
+        palette.update_idletasks()
+        px = self.shapes_arrow_btn.winfo_rootx()
+        py = self.shapes_arrow_btn.winfo_rooty() + self.shapes_arrow_btn.winfo_height() + 2
+        palette.geometry(f"+{px}+{py}")
+        self._shapes_palette = palette
+
+    def _select_shape(self, kind):
+        self._last_shape = kind
+        self._set_tool(kind)
+        self._update_shapes_button_icon()
+        self._close_shapes_palette()
 
     def _pick_color(self):
         res = colorchooser.askcolor(color=self.color, parent=self.root)
@@ -712,7 +922,7 @@ class WhiteboardApp:
         c = self.width_preview
         c.delete("all")
         c.configure(bg=self.theme["bg"])
-        y = 10
+        y = 12
         c.create_oval(4, y - self.width / 2, 4 + self.width, y + self.width / 2,
                       fill=self.theme["accent"], outline=self.theme["ink"], width=1)
 
@@ -725,6 +935,16 @@ class WhiteboardApp:
             self._adjust_width(1)
         elif event.delta < 0:
             self._adjust_width(-1)
+
+    def _toggle_cursors(self):
+        # Hide/show remote cursor markers.
+        state = "normal" if self.show_cursors_var.get() else "hidden"
+        for oval, text in self.cursor_items.values():
+            for item in (oval, text):
+                try:
+                    self.canvas.itemconfigure(item, state=state)
+                except tk.TclError:
+                    pass
 
     def _toggle_theme(self):
         self.theme_name = "dark" if self.theme_name == "light" else "light"
@@ -759,8 +979,10 @@ class WhiteboardApp:
         style.configure("ToolActive.TButton", background=t["accent"], foreground=t["on_accent"],
                         padding=4, relief="flat", borderwidth=1, bordercolor=t["accent"])
         style.map("ToolActive.TButton",
-                  background=[("pressed", t["accent_hover"]), ("active", t["accent_hover"])],
-                  foreground=[("disabled", t["ink_muted"])])
+                  background=[("pressed", t["accent_hover"]), ("active", t["accent_hover"]),
+                              ("disabled", t["surface_alt"])],
+                  foreground=[("disabled", t["ink_muted"])],
+                  bordercolor=[("disabled", t["border"])])
         style.configure("TEntry", fieldbackground=t["surface"], foreground=t["ink"],
                         insertcolor=t["ink"], bordercolor=t["border"])
         style.configure("TCombobox", fieldbackground=t["surface"], foreground=t["ink"],
@@ -783,7 +1005,8 @@ class WhiteboardApp:
             self._draw_board_background()
         if hasattr(self, "chat_text"):
             self.chat_text.configure(bg=t["surface"], fg=t["ink"], insertbackground=t["ink"],
-                                     selectbackground=t["accent"], selectforeground=t["on_accent"])
+                                     selectbackground=t["accent"], selectforeground=t["on_accent"],
+                                     highlightbackground=t["border"], highlightcolor=t["border"])
             self._configure_chat_tags()
         if hasattr(self, "width_preview"):
             self.width_preview.configure(bg=t["bg"])
@@ -796,6 +1019,7 @@ class WhiteboardApp:
         self._update_activity_indicators()
         if self.debug_label is not None:
             self.debug_label.configure(bg=t["surface"], fg=t["ink"])
+        self._update_shapes_button_icon()
         self._update_permissions()
 
     def _configure_chat_tags(self):
@@ -990,6 +1214,13 @@ class WhiteboardApp:
                 self.net.send(msg)
         elif self.tool == "eraser":
             self._erase_at(lx, ly)
+        elif self.tool not in ("pen", "eraser", "text"):
+            self._shape_start = (lx, ly)
+            self._shape_kind = self.tool
+            self._shape_preview = None
+            self._update_shape_preview(lx, ly, lx, ly, event.state)
+        elif self.tool == "text":
+            self._place_text_entry(event.x, event.y, lx, ly)
 
     def _on_motion(self, event):
         lx, ly = self._to_logical(event.x, event.y)
@@ -1024,6 +1255,14 @@ class WhiteboardApp:
         elif self.tool == "eraser":
             # Hover highlight and sweep-to-erase.
             self._erase_at(lx, ly)
+        elif self.tool not in ("pen", "eraser", "text"):
+            if self._shape_start is not None:
+                x0, y0 = self._shape_start
+                shift = bool(event.state & 0x0001)
+                x2, y2 = (lx, ly)
+                if shift:
+                    x2, y2 = shift_constraint(self._shape_kind, x0, y0, lx, ly)
+                self._update_shape_preview(x0, y0, x2, y2, event.state)
         else:
             # Throttled cursor move.
             now = time.time()
@@ -1064,6 +1303,48 @@ class WhiteboardApp:
         self._last_erased = sid
 
     def _on_release(self, event):
+        if self.tool not in ("pen", "eraser", "text"):
+            if self._shape_start is None:
+                return
+            x0, y0 = self._shape_start
+            lx, ly = self._to_logical(event.x, event.y)
+            shift = bool(event.state & 0x0001)
+            if shift:
+                lx, ly = shift_constraint(self._shape_kind, x0, y0, lx, ly)
+            # clamp
+            lx = max(0.0, min(float(LOGICAL_WIDTH), lx))
+            ly = max(0.0, min(float(LOGICAL_HEIGHT), ly))
+            x0 = max(0.0, min(float(LOGICAL_WIDTH), x0))
+            y0 = max(0.0, min(float(LOGICAL_HEIGHT), y0))
+            self._clear_shape_preview()
+            if abs(lx - x0) <= 1.0 and abs(ly - y0) <= 1.0:
+                # A click without a drag creates no shape.
+                self._shape_start = None
+                self._shape_preview = None
+                return
+            kind = self._shape_kind
+            sid = str(uuid.uuid4())
+            op_id = str(uuid.uuid4())
+            closed = kind not in ("line", "arrow", "double_arrow")
+            fill = self.color if (self.fill_var.get() and closed) else None
+            msg = {"type": "shape", "op_id": op_id, "shape_id": sid, "kind": kind,
+                   "p1": [x0, y0], "p2": [lx, ly], "color": self.color,
+                   "width": self.width, "fill": fill}
+            # optimistic
+            obj = {"id": sid, "type": "shape", "kind": kind, "p1": [x0, y0],
+                   "p2": [lx, ly], "color": self.color, "width": self.width,
+                   "fill": fill, "user": self.username, "seq": 0}
+            self.state.objects[sid] = obj
+            self._add_shape_item(obj)
+            self.state.track_pending(op_id)
+            self._pending_ops[op_id] = msg
+            self.state.start_drawing(self.username)
+            self.state.end_drawing(self.username)
+            if self.net:
+                self.net.send(msg)
+            self._shape_start = None
+            self._shape_preview = None
+            return
         if self.tool != "pen" or not self.local_strokes:
             return
         lx, ly = self._to_logical(event.x, event.y)
@@ -1119,7 +1400,12 @@ class WhiteboardApp:
             try:
                 while True:
                     msg = self.net.inbox.get_nowait()
-                    self._handle_message(msg)
+                    try:
+                        self._handle_message(msg)
+                    except Exception as exc:
+                        import logging
+                        logging.getLogger("whiteboard.ui").exception("error handling message: %s", exc)
+                        self._toast(f"Message error: {exc}")
             except queue.Empty:
                 pass
 
@@ -1130,6 +1416,32 @@ class WhiteboardApp:
             self._blink = not self._blink if self.state.active_drawers else False
             if changed or self.state.active_drawers:
                 self._rebuild_participants()
+
+            # Hide cursors idle for 5 seconds.
+            now = time.time()
+            for user in list(self.cursor_items.keys()):
+                if now - self._cursor_last.get(user, now) > 5.0:
+                    oval, text = self.cursor_items.pop(user)
+                    try:
+                        self.canvas.delete(oval)
+                        self.canvas.delete(text)
+                    except tk.TclError:
+                        pass
+                    self._cursor_last.pop(user, None)
+            if not getattr(self, "show_cursors_var", None) or not self.show_cursors_var.get():
+                for oval, text in self.cursor_items.values():
+                    try:
+                        self.canvas.itemconfigure(oval, state="hidden")
+                        self.canvas.itemconfigure(text, state="hidden")
+                    except tk.TclError:
+                        pass
+            else:
+                for oval, text in self.cursor_items.values():
+                    try:
+                        self.canvas.itemconfigure(oval, state="normal")
+                        self.canvas.itemconfigure(text, state="normal")
+                    except tk.TclError:
+                        pass
 
             # Latency ping every 5 seconds.
             now = time.time()
@@ -1197,7 +1509,8 @@ class WhiteboardApp:
         if mtype == "cursor_move":
             self._update_cursor(msg)
             return
-        if mtype in ("stroke_start", "stroke_points", "stroke_end", "delete_object"):
+        if mtype in ("stroke_start", "stroke_points", "stroke_end", "delete_object",
+                     "shape", "text"):
             op_id = msg.get("op_id")
             if self.state.is_pending(op_id):
                 self.state.clear_pending(op_id)
@@ -1211,6 +1524,7 @@ class WhiteboardApp:
             status = self.state.apply_op(msg)
             if status == "gap":
                 self._sync_state = "syncing"
+                self._resync_pending = True
                 if self.net:
                     self.net.send({"type": "resync_request", "last_seq": self.state.applied_seq})
                 return
@@ -1224,12 +1538,26 @@ class WhiteboardApp:
                     if getattr(self, "_hover_erase", None) == tid:
                         self._hover_erase = None
                 return
+            if mtype == "shape":
+                sid = msg.get("shape_id")
+                obj = self.state.objects.get(sid) if isinstance(sid, str) else None
+                if isinstance(obj, dict):
+                    self._add_shape_item(obj)
+                return
+            if mtype == "text":
+                oid = msg.get("obj_id")
+                obj = self.state.objects.get(oid) if isinstance(oid, str) else None
+                if isinstance(obj, dict):
+                    self._add_text_item(obj)
+                return
             # Render remote stroke updates.
             self._render_op(msg)
             return
         if mtype == "snapshot":
             self.state.apply_snapshot(msg)
             self._sync_state = "synced"
+            self._resync_pending = False
+            self.state.behind_since = None
             self._redraw_all()
             return
         if mtype == "ops_since":
@@ -1237,6 +1565,8 @@ class WhiteboardApp:
             if isinstance(ops, list):
                 self.state.apply_ops_since(int(msg.get("from_seq", self.state.applied_seq)), ops)
                 self._sync_state = "synced"
+                self._resync_pending = False
+                self.state.behind_since = None
                 # Redraw to be safe.
                 self._redraw_all()
             return
@@ -1276,6 +1606,28 @@ class WhiteboardApp:
                 for obj in msg.get("objects", []):
                     if isinstance(obj, dict) and "id" in obj:
                         self.state.objects[obj["id"]] = obj
+                        if obj.get("type") == "shape":
+                            self._add_shape_item(obj)
+                        elif obj.get("type") == "text":
+                            self._add_text_item(obj)
+                        else:
+                            self._add_stroke_item(obj)
+            elif action == "remove_object":
+                tid = msg.get("target_id")
+                if isinstance(tid, str):
+                    item = self.canvas_items.pop(tid, None)
+                    if item is not None:
+                        self.canvas.delete(item)
+                    self.state.objects.pop(tid, None)
+            elif action == "add_object":
+                obj = msg.get("object")
+                if isinstance(obj, dict) and "id" in obj:
+                    self.state.objects[obj["id"]] = obj
+                    if obj.get("type") == "shape":
+                        self._add_shape_item(obj)
+                    elif obj.get("type") == "text":
+                        self._add_text_item(obj)
+                    else:
                         self._add_stroke_item(obj)
             return
         if mtype == "redo":
@@ -1285,7 +1637,24 @@ class WhiteboardApp:
                 if isinstance(obj, dict) and "id" in obj:
                     self.state.objects[obj["id"]] = obj
                     self._add_stroke_item(obj)
+            elif action == "add_object":
+                obj = msg.get("object")
+                if isinstance(obj, dict) and "id" in obj:
+                    self.state.objects[obj["id"]] = obj
+                    if obj.get("type") == "shape":
+                        self._add_shape_item(obj)
+                    elif obj.get("type") == "text":
+                        self._add_text_item(obj)
+                    else:
+                        self._add_stroke_item(obj)
             elif action == "remove_stroke":
+                tid = msg.get("target_id")
+                if isinstance(tid, str):
+                    item = self.canvas_items.pop(tid, None)
+                    if item is not None:
+                        self.canvas.delete(item)
+                    self.state.objects.pop(tid, None)
+            elif action == "remove_object":
                 tid = msg.get("target_id")
                 if isinstance(tid, str):
                     item = self.canvas_items.pop(tid, None)
@@ -1386,6 +1755,153 @@ class WhiteboardApp:
         self.canvas_items[sid] = item
         self._raise_matte()
 
+    def _add_shape_item(self, obj: dict[str, Any]) -> None:
+        sid = obj.get("id")
+        if not isinstance(sid, str) or sid in self.canvas_items:
+            return
+        kind = obj.get("kind")
+        p1 = obj.get("p1", [0, 0])
+        p2 = obj.get("p2", [0, 0])
+        color = obj.get("color", "#000000")
+        width = self._stroke_width(obj.get("width", 2))
+        fill = obj.get("fill")
+        try:
+            import shapes_geometry as _sg
+            pts = _sg.shape_points(kind, float(p1[0]), float(p1[1]),
+                                   float(p2[0]), float(p2[1]))
+        except Exception:
+            pts = []
+        if not pts:
+            return
+        flat = []
+        for (lx, ly) in pts:
+            cx, cy = self._to_window(lx, ly)
+            flat.extend((cx, cy))
+        if len(flat) < 4:
+            return
+        # closed shape if first==last
+        item = self._draw_shape(kind, float(p1[0]), float(p1[1]),
+                                float(p2[0]), float(p2[1]), color, width, fill,
+                                "final", (sid,))
+        if item is None:
+            return
+        self.canvas_items[sid] = item
+        self._raise_matte()
+
+    def _add_text_item(self, obj: dict[str, Any]) -> None:
+        oid = obj.get("id")
+        if not isinstance(oid, str) or oid in self.canvas_items:
+            return
+        x, y = self._to_window(float(obj.get("x", 0)), float(obj.get("y", 0)))
+        size = int(max(8, float(obj.get("size", 12)) * self.scale))
+        color = obj.get("color", "#000000")
+        text = str(obj.get("text", ""))
+        item = self.canvas.create_text(x, y, text=text, fill=color, anchor="nw",
+                                       font=("Segoe UI", size), tags=(oid,))
+        self.canvas_items[oid] = item
+        self._raise_matte()
+
+    def _update_shape_preview(self, x0, y0, x1, y1, state):
+        self._clear_shape_preview()
+        kind = self._shape_kind
+        color = self.color
+        width = self._stroke_width(self.width)
+        item = self._draw_shape(kind, x0, y0, x1, y1, color, width, None,
+                                "preview", ("shape_preview",))
+        self._shape_preview = item
+        if item is not None:
+            self._raise_matte()
+
+    def _draw_shape(self, kind, x1, y1, x2, y2, color, width, fill, style="final",
+                    tags=()):
+        """Render one shape. Shared by committed shapes and live previews."""
+        try:
+            import shapes_geometry as _sg
+            pts = _sg.shape_points(kind, float(x1), float(y1), float(x2), float(y2))
+        except Exception:
+            pts = []
+        if not pts:
+            return None
+        flat = []
+        for (lx, ly) in pts:
+            cx, cy = self._to_window(lx, ly)
+            flat.extend((cx, cy))
+        if len(flat) < 4:
+            return None
+        tags = tuple(tags) if not isinstance(tags, tuple) else tags
+        dashed = (4, 4) if style == "preview" else None
+        if kind in ("line", "arrow", "double_arrow"):
+            kwargs = {"fill": color, "width": width, "tags": tags}
+            if dashed is not None:
+                kwargs["dash"] = dashed
+            if kind in ("arrow", "double_arrow"):
+                kwargs["arrow"] = tk.LAST
+            return self.canvas.create_line(*flat, **kwargs)
+        kwargs = {"outline": color, "width": width, "tags": tags}
+        if dashed is not None:
+            kwargs["dash"] = dashed
+        item_fill = fill if (style == "final" and fill) else ""
+        kwargs["fill"] = item_fill
+        return self.canvas.create_polygon(*flat, **kwargs)
+
+    def _clear_shape_preview(self):
+        if self._shape_preview is not None:
+            try:
+                self.canvas.delete(self._shape_preview)
+            except tk.TclError:
+                pass
+            self._shape_preview = None
+
+    def _place_text_entry(self, px, py, lx, ly):
+        if self.role == "viewer":
+            return
+        if getattr(self, "_text_entry", None) is not None:
+            return
+        cx, cy = self._to_window(lx, ly)
+        t = self.theme
+        entry = tk.Text(self.canvas, width=20, height=2, font=("Segoe UI", int(self.text_size.get())),
+                        wrap="word", bg=t["surface"], fg=t["ink"], insertbackground=t["ink"],
+                        selectbackground=t["accent"], selectforeground=t["on_accent"],
+                        borderwidth=1, relief="solid", highlightthickness=1,
+                        highlightbackground=t["accent"], highlightcolor=t["accent"])
+        entry.place(x=cx, y=cy)
+        entry.focus_set()
+        self._text_entry = entry
+        self._text_pos = (lx, ly)
+
+        def commit(event=None):
+            text = entry.get("1.0", "end-1c")
+            entry.destroy()
+            self._text_entry = None
+            if not text.strip():
+                return "break"
+            oid = str(uuid.uuid4())
+            op_id = str(uuid.uuid4())
+            size = int(self.text_size.get())
+            msg = {"type": "text", "op_id": op_id, "obj_id": oid, "x": lx, "y": ly,
+                   "text": text, "size": size, "color": self.color}
+            obj = {"id": oid, "type": "text", "x": lx, "y": ly, "text": text,
+                   "size": size, "color": self.color, "user": self.username, "seq": 0}
+            self.state.objects[oid] = obj
+            self._add_text_item(obj)
+            self.state.track_pending(op_id)
+            self._pending_ops[op_id] = msg
+            self.state.start_drawing(self.username)
+            self.state.end_drawing(self.username)
+            if self.net:
+                self.net.send(msg)
+            return "break"
+
+        def cancel(event=None):
+            entry.destroy()
+            self._text_entry = None
+            return "break"
+
+        entry.bind("<Return>", lambda e: commit() if not (e.state & 0x0001) else None)
+        entry.bind("<Shift-Return>", lambda e: None)
+        entry.bind("<Escape>", lambda e: cancel())
+        entry.bind("<FocusOut>", lambda e: cancel())
+
     def _draw_board_background(self) -> None:
         self.canvas.delete("board_bg")
         w, h = self._canvas_size()
@@ -1428,13 +1944,20 @@ class WhiteboardApp:
         # Item ids in cursor_items are stale after delete("all"); the next
         # cursor message recreates them.
         self.cursor_items.clear()
+        self._cursor_last.clear()
         self._hover_erase = None
         self._draw_board_background()
-        for sid, obj in self.state.objects.items():
-            pts = obj.get("points", [])
-            if not isinstance(pts, list) or len(pts) < 1:
-                continue
-            self._add_stroke_item(obj)
+        for oid, obj in self.state.objects.items():
+            otype = obj.get("type")
+            if otype == "stroke":
+                pts = obj.get("points", [])
+                if not isinstance(pts, list) or len(pts) < 1:
+                    continue
+                self._add_stroke_item(obj)
+            elif otype == "shape":
+                self._add_shape_item(obj)
+            elif otype == "text":
+                self._add_text_item(obj)
         self.canvas.tag_raise("matte")
         if self.debug_overlay:
             self._raise_debug_overlay()
@@ -1624,10 +2147,34 @@ class WhiteboardApp:
             text="Connected" if (self.net and self.net.connected) else "Disconnected"))
 
     def _report_exception(self, exc_type, exc_value, exc_tb):
+        import logging
+        import time
         import traceback
-        logging.getLogger("whiteboard.ui").error("unhandled UI exception: %s", "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
-        if not getattr(self, "_poll_error_shown", False):
-            self._poll_error_shown = True
+
+        logger = logging.getLogger("whiteboard.ui")
+        frames = traceback.extract_tb(exc_tb)
+        if frames:
+            last = frames[-1]
+            location = f"{last.filename}:{last.lineno}"
+        else:
+            location = "<unknown>"
+        key = (getattr(exc_type, "__name__", str(exc_type)), str(exc_value), location)
+        now = time.time()
+        self._ui_error_counts[key] = self._ui_error_counts.get(key, 0) + 1
+        count = self._ui_error_counts[key]
+
+        if key not in self._ui_error_last_full:
+            self._ui_error_last_full[key] = now
+            logger.error("unhandled UI exception: %s",
+                        "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+        elif (now - self._ui_error_last_summary) >= self._UI_ERROR_LOG_INTERVAL:
+            self._ui_error_last_summary = now
+            total = sum(self._ui_error_counts.values())
+            logger.error("UI exceptions repeated: %d total; latest %s: %s (%s) count=%d",
+                        total, key[0], key[1], key[2], count)
+
+        if (now - self._ui_error_last_toast) >= self._UI_ERROR_TOAST_INTERVAL:
+            self._ui_error_last_toast = now
             try:
                 self._toast(f"UI error: {exc_value}")
             except Exception:
@@ -1665,7 +2212,7 @@ class WhiteboardApp:
             else:
                 oval = self.canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, fill="", outline=color, tags=("cursor",))
             text = self.canvas.create_text(text_x, cy, text=user, fill=color,
-                                           font=("Segoe UI", 9, "bold"), anchor=anchor,
+                                           font=("Segoe UI", 8), anchor=anchor,
                                            tags=("cursor",))
             self.cursor_items[user] = (oval, text)
         else:
@@ -1677,6 +2224,7 @@ class WhiteboardApp:
             self.canvas.coords(oval, cx - 4, cy - 4, cx + 4, cy + 4)
             self.canvas.coords(text, text_x, cy)
             self.canvas.itemconfig(text, anchor=anchor)
+        self._cursor_last[user] = time.time()
         self._raise_matte()
 
     # ------------------------------------------------------------------ #
@@ -1706,11 +2254,31 @@ class WhiteboardApp:
         if getattr(self, "_last_seq_text", None) != seq_text:
             self._last_seq_text = seq_text
             self.status_seq.config(text=seq_text)
-        sync_text = getattr(self, "_sync_state", "synced")
+        now = time.time()
+        applied = self.state.applied_seq
+        latest = getattr(self.state, "latest_seq", applied)
+        resync_pending = getattr(self, "_resync_pending", False) or self._sync_state == "syncing"
+        if applied >= latest and latest > 0 and not resync_pending:
+            sync_text = "synced"
+            color = self.theme["ink_muted"]
+            self.state.behind_since = None
+        elif applied >= latest and latest == 0:
+            sync_text = "synced"
+            color = self.theme["ink_muted"]
+            self.state.behind_since = None
+        else:
+            if self.state.behind_since is None:
+                self.state.behind_since = now
+            if now - self.state.behind_since > 5.0:
+                sync_text = "out of sync"
+                color = self.theme["danger"]
+            else:
+                sync_text = "syncing..."
+                color = self.theme["highlight"]
         if getattr(self, "_last_sync_text", None) != sync_text:
             self._last_sync_text = sync_text
             if hasattr(self, "status_sync"):
-                self.status_sync.config(text=sync_text)
+                self.status_sync.config(text=sync_text, foreground=color)
 
 
 class Tooltip:

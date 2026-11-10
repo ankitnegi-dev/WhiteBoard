@@ -154,6 +154,56 @@ pixel, logical coordinate, board rectangle, scale, offset, and inset.
 
 ## 9. Theme toggle
 
-A single button in the toolbar switches light/dark. The board remains light
-paper in both themes. The choice is stored in memory only; persistence comes
-later.
+A single button in the header (next to the identity chip) switches light/dark.
+The board remains light paper in both themes. The choice is stored in memory
+only; persistence comes later.
+
+## 10. Toolbar layout (top, two rows)
+
+The toolbar is a top, wrap-free bar above the board. The old left rail is
+gone, so the board uses the full width beside the right rail. There is no
+scrolling anywhere in the toolbar: a Scrollbar or a canvas scroll container
+is never used for toolbar controls.
+
+Row 1, left to right:
+
+- Tools: Pen, Eraser, Text. A Select tool is not present in this build.
+- Shapes: a split control. The main button activates the last-used shape
+  and shows that shape as a small drawn icon. The small arrow button opens
+  the grouped Shapes palette (Basic, Flowchart, Callout).
+- Divider.
+- Style: Color button plus a clickable color swatch, Width slider with a
+  numeric value and a preview dot, Fill toggle, Text size dropdown.
+
+Row 2, left to right:
+
+- Edit: Undo, Redo.
+- Divider.
+- File: Clear, Save, Load.
+- A reserved gap for Export and History. Those buttons are not created
+  until those features exist.
+- View controls are omitted because this build has no zoom controls.
+
+Every toolbar button uses the same fixed height, currently 37 px (the
+design target was about 34 px), and is sized from its content with a
+sensible minimum width. Labels and icons are never clipped. Each button
+has a tooltip, an active/selected style (accent fill), and a readable
+disabled style in both themes. Host-only actions stay visible but disabled
+for editors; viewer-disabled actions use the same rule.
+
+Theme and Show cursors live in the identity header in the right rail, on a
+second line under the user name and role. Keeping them there means a long
+username can never push them off screen. The toggles use full labels and
+tooltips.
+
+The layout is verified at 1280x720, 1366x768, and 1920x1080. At 1280 wide,
+row 1 requests about 900 px and row 2 about 543 px, so both rows fit without
+shortening labels or adding a scrollbar. If a future control cannot fit,
+shorten a label or move it to an icon with a tooltip; do not add a toolbar
+scrollbar.
+
+The right rail order is identity, room code, participants, host controls,
+then chat. Chat text absorbs the remaining height and the chat input is
+pinned to the bottom, so host controls and chat input stay reachable at the
+minimum supported window height.
+

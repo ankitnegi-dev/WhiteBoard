@@ -146,3 +146,21 @@ def test_active_drawers_from_ops():
     state.apply_op({"type": "clear_canvas", "seq": 4, "op_id": "o4", "user": "alice"})
     # clear does not add; active already empty
     assert "alice" not in state.active_drawers
+
+def test_sync_tracking():
+    s = BoardState()
+    s.apply_snapshot({"seq": 5, "objects": [], "chat_tail": []})
+    assert s.applied_seq == 5
+    assert s.latest_seq == 5
+    op = {"type": "stroke_start", "op_id": "o1", "stroke_id": "s1",
+          "tool": "pen", "color": "#000000", "width": 2, "x": 1, "y": 2,
+          "seq": 7}
+    assert s.apply_op(op) == "gap"
+    assert s.applied_seq == 5
+    assert s.latest_seq == 7
+    op2 = {"type": "stroke_start", "op_id": "o2", "stroke_id": "s2",
+           "tool": "pen", "color": "#000000", "width": 2, "x": 1, "y": 2,
+           "seq": 6}
+    assert s.apply_op(op2) == "applied"
+    assert s.applied_seq == 7
+    assert s.latest_seq == 7

@@ -9,6 +9,11 @@ lives here.
 from __future__ import annotations
 
 import re
+
+try:
+    from protocol import SHAPE_KINDS
+except Exception:  # pragma: no cover
+    SHAPE_KINDS = ("line", "rect", "ellipse", "arrow")
 import threading
 import time
 from dataclasses import dataclass
@@ -30,7 +35,8 @@ MIN_WIDTH = 1.0
 MAX_CHAT_LENGTH = 500
 MAX_OPS_SINCE = 1000
 
-DRAWING_OPS = {"stroke_start", "stroke_points", "stroke_end", "delete_object"}
+DRAWING_OPS = {"stroke_start", "stroke_points", "stroke_end", "delete_object",
+               "shape", "text"}
 TOOLS = {"pen", "eraser"}
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -179,6 +185,56 @@ class Room:
                 return False, "text_too_long"
             return True, ""
 
+        if mtype == "shape":
+            if not self._require_str(msg.get("op_id")):
+                return False, "bad_op_id"
+            if not self._require_str(msg.get("shape_id")):
+                return False, "bad_shape_id"
+            kind = msg.get("kind")
+            if kind not in SHAPE_KINDS:
+                return False, "bad_kind"
+            p1 = msg.get("p1")
+            p2 = msg.get("p2")
+            if not (isinstance(p1, (list, tuple)) and len(p1) == 2):
+                return False, "bad_p1"
+            if not (isinstance(p2, (list, tuple)) and len(p2) == 2):
+                return False, "bad_p2"
+            if not self._in_canvas(p1[0], p1[1]):
+                return False, "bad_coordinates"
+            if not self._in_canvas(p2[0], p2[1]):
+                return False, "bad_coordinates"
+            color = msg.get("color")
+            if not isinstance(color, str) or not COLOR_RE.match(color):
+                return False, "bad_color"
+            width = msg.get("width")
+            if not self._is_number(width) or not (MIN_WIDTH <= width <= MAX_WIDTH):
+                return False, "bad_width"
+            fill = msg.get("fill", None)
+            if fill is not None:
+                if not isinstance(fill, str) or not COLOR_RE.match(fill):
+                    return False, "bad_fill"
+            return True, ""
+
+        if mtype == "text":
+            if not self._require_str(msg.get("op_id")):
+                return False, "bad_op_id"
+            if not self._require_str(msg.get("obj_id")):
+                return False, "bad_obj_id"
+            if not self._in_canvas(msg.get("x"), msg.get("y")):
+                return False, "bad_coordinates"
+            t = msg.get("text")
+            if not isinstance(t, str) or not t.strip():
+                return False, "bad_text"
+            if len(t) > MAX_TEXT_LENGTH:
+                return False, "text_too_long"
+            size = msg.get("size")
+            if not self._is_number(size) or not (8 <= size <= 72):
+                return False, "bad_size"
+            color = msg.get("color")
+            if not isinstance(color, str) or not COLOR_RE.match(color):
+                return False, "bad_color"
+            return True, ""
+
         return False, "unknown_type"
 
     def _require_str(self, v: Any) -> bool:
@@ -239,6 +295,45 @@ class Room:
                     )
                 self.objects.pop(tid, None)
                 self.redo_stacks.pop(username, None)
+            elif mtype == "shape":
+                sid = msg["shape_id"]
+                if sid in self.objects:
+                    return "invalid", None, "shape_already_exists"
+                obj = {
+                    "id": sid,
+                    "type": "shape",
+                    "kind": msg["kind"],
+                    "p1": [msg["p1"][0], msg["p1"][1]],
+                    "p2": [msg["p2"][0], msg["p2"][1]],
+                    "color": msg["color"],
+                    "width": msg["width"],
+                    "fill": msg.get("fill", None),
+                    "user": username,
+                }
+                self.objects[sid] = obj
+                self.redo_stacks.pop(username, None)
+                self.undo_stacks.setdefault(username, []).append(
+                    {"kind": "object", "user": username, "object_id": sid, "object": dict(obj)}
+                )
+            elif mtype == "text":
+                oid = msg["obj_id"]
+                if oid in self.objects:
+                    return "invalid", None, "text_already_exists"
+                obj = {
+                    "id": oid,
+                    "type": "text",
+                    "x": msg["x"],
+                    "y": msg["y"],
+                    "text": msg["text"],
+                    "size": msg["size"],
+                    "color": msg["color"],
+                    "user": username,
+                }
+                self.objects[oid] = obj
+                self.redo_stacks.pop(username, None)
+                self.undo_stacks.setdefault(username, []).append(
+                    {"kind": "object", "user": username, "object_id": oid, "object": dict(obj)}
+                )
 
             # Stamp and append.
             self.seq += 1
@@ -330,6 +425,12 @@ class Room:
                     self.objects[tid] = dict(obj)
                 broadcast = {"type": "undo", "op_id": op_id, "action": "restore_object",
                              "object": dict(obj) if isinstance(obj, dict) else None, "user": username}
+            elif kind == "object":
+                oid = entry.get("object_id")
+                if isinstance(oid, str) and oid in self.objects:
+                    del self.objects[oid]
+                broadcast = {"type": "undo", "op_id": op_id, "action": "remove_object",
+                              "target_id": oid, "user": username}
             elif kind == "clear":
                 for o in entry.get("cleared", []):
                     if isinstance(o, dict) and "id" in o and o["id"] not in self.objects:
@@ -374,6 +475,12 @@ class Room:
                     self.objects.pop(tid, None)
                 broadcast = {"type": "redo", "op_id": op_id, "action": "remove_stroke",
                              "target_id": tid, "user": username}
+            elif kind == "object":
+                obj = entry.get("object")
+                if isinstance(obj, dict) and "id" in obj and obj["id"] not in self.objects:
+                    self.objects[obj["id"]] = dict(obj)
+                broadcast = {"type": "redo", "op_id": op_id, "action": "add_object",
+                              "object": dict(obj) if isinstance(obj, dict) else None, "user": username}
             elif kind == "clear":
                 ids = [o["id"] for o in entry.get("cleared", []) if isinstance(o, dict) and "id" in o]
                 for tid in ids:

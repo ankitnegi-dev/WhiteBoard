@@ -26,6 +26,19 @@ from typing import Any, Dict
 # later milestone) will raise this or use a chunked path.
 MAX_MESSAGE_SIZE: int = 1 * 1024 * 1024
 
+# Whitelist of shape kinds accepted by the server. Old kinds (line, rect,
+# ellipse, arrow) are kept so saved boards still load.
+SHAPE_KINDS: tuple[str, ...] = (
+    "line", "arrow", "double_arrow",
+    "rectangle", "rounded_rectangle", "ellipse",
+    "triangle", "right_triangle", "diamond", "pentagon", "hexagon",
+    "star", "plus", "heart",
+    "process", "decision", "terminator", "data", "document",
+    "speech_bubble",
+    # legacy
+    "rect",
+)
+
 # 4-byte big-endian unsigned length prefix, as required by the spec.
 _LENGTH_FORMAT: str = ">I"
 _LENGTH_SIZE: int = struct.calcsize(_LENGTH_FORMAT)

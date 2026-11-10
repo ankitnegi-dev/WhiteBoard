@@ -15,6 +15,8 @@ class BoardState:
     def __init__(self) -> None:
         self.objects: dict[str, dict[str, Any]] = {}   # stroke_id -> object
         self.applied_seq: int = 0
+        self.latest_seq: int = 0
+        self.behind_since: Optional[float] = None
         self.participants: list[dict[str, Any]] = []
         self.chat: list[dict[str, Any]] = []
         self.pending_op_ids: set[str] = set()
@@ -27,7 +29,10 @@ class BoardState:
     def apply_snapshot(self, snapshot: dict[str, Any]) -> None:
         objs = snapshot.get("objects", [])
         self.objects = {o["id"]: dict(o) for o in objs if isinstance(o, dict) and "id" in o}
-        self.applied_seq = int(snapshot.get("seq", 0))
+        seq = int(snapshot.get("seq", 0))
+        self.applied_seq = seq
+        if seq > self.latest_seq:
+            self.latest_seq = seq
         tail = snapshot.get("chat_tail")
         if isinstance(tail, list):
             self.chat = [dict(c) for c in tail]
@@ -90,12 +95,16 @@ class BoardState:
         if not isinstance(op, dict):
             return "duplicate"
         seq = op.get("seq")
+        if isinstance(seq, int) and not isinstance(seq, bool) and seq > self.latest_seq:
+            self.latest_seq = seq
         if not isinstance(seq, int) or isinstance(seq, bool):
             # No seq: treat as a live broadcast we cannot order; apply it.
             self._apply_one(op)
             return "applied"
         if seq <= self.applied_seq:
             return "duplicate"
+        if seq > self.latest_seq:
+            self.latest_seq = seq
         if seq == self.applied_seq + 1:
             self._apply_one(op)
             self.applied_seq = seq
@@ -142,6 +151,39 @@ class BoardState:
             if obj is not None:
                 obj["ended"] = True
             self.end_drawing(user if isinstance(user, str) else "")
+        elif mtype == "shape":
+            sid = op.get("shape_id")
+            if isinstance(sid, str):
+                self.objects[sid] = {
+                    "id": sid,
+                    "type": "shape",
+                    "kind": op.get("kind", "line"),
+                    "p1": list(op.get("p1", [0, 0])),
+                    "p2": list(op.get("p2", [0, 0])),
+                    "color": op.get("color", "#000000"),
+                    "width": op.get("width", 2),
+                    "fill": op.get("fill", None),
+                    "user": user,
+                    "seq": op.get("seq", 0),
+                }
+            self.start_drawing(user if isinstance(user, str) else "")
+            self.end_drawing(user if isinstance(user, str) else "")
+        elif mtype == "text":
+            oid = op.get("obj_id")
+            if isinstance(oid, str):
+                self.objects[oid] = {
+                    "id": oid,
+                    "type": "text",
+                    "x": op.get("x", 0),
+                    "y": op.get("y", 0),
+                    "text": op.get("text", ""),
+                    "size": op.get("size", 12),
+                    "color": op.get("color", "#000000"),
+                    "user": user,
+                    "seq": op.get("seq", 0),
+                }
+            self.start_drawing(user if isinstance(user, str) else "")
+            self.end_drawing(user if isinstance(user, str) else "")
         elif mtype == "delete_object":
             tid = op.get("target_id")
             if isinstance(tid, str):
@@ -156,6 +198,14 @@ class BoardState:
                 if isinstance(tid, str):
                     self.objects.pop(tid, None)
             elif action == "restore_object":
+                obj = op.get("object")
+                if isinstance(obj, dict) and "id" in obj:
+                    self.objects[obj["id"]] = dict(obj)
+            elif action == "remove_object":
+                tid = op.get("target_id")
+                if isinstance(tid, str):
+                    self.objects.pop(tid, None)
+            elif action == "add_object":
                 obj = op.get("object")
                 if isinstance(obj, dict) and "id" in obj:
                     self.objects[obj["id"]] = dict(obj)
@@ -181,6 +231,8 @@ class BoardState:
     def apply_ops_since(self, from_seq: int, ops: list[dict[str, Any]]) -> None:
         for op in sorted(ops, key=lambda o: o.get("seq", 0)):
             self.apply_op(op)
+        if isinstance(from_seq, int) and from_seq > self.latest_seq:
+            self.latest_seq = from_seq
 
     def needs_resync(self, op: dict[str, Any]) -> bool:
         seq = op.get("seq")
