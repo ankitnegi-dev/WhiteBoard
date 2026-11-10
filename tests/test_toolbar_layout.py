@@ -153,10 +153,6 @@ def test_new_toolbar_buttons_exist_and_disabled(app):
         assert button.winfo_class() == "TButton"
         assert not button.instate(["disabled"])
         assert button._tooltip is not None
-    history = application.history_btn
-    assert history.winfo_class() == "TButton"
-    assert history.instate(["disabled"])
-    assert history._tooltip.text == "Coming soon"
     root, application = app
     root.update()
     before = application.fill_btn.winfo_height()

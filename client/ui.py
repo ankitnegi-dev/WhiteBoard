@@ -575,11 +575,9 @@ class WhiteboardApp:
         self.save_btn = action_button(row2, "Save", self._save_board, "Host only")
         self.load_btn = action_button(row2, "Load", self._load_board, "Host only")
         self.export_btn = action_button(row2, "Export", self._export_board, "Export board as PNG", width=7)
-        self.history_btn = action_button(row2, "History", lambda: None, "Coming soon", width=8)
-        self.history_btn.state(["disabled"])
 
-        # Reserved room for Export and History; those buttons arrive later.
-        self.file_reserved = ttk.Frame(row2, width=170, height=34)
+        # Reserved room for future History button; not built yet.
+        self.file_reserved = ttk.Frame(row2, width=90, height=34)
         self.file_reserved.pack(side="left", padx=(10, 2))
         self.file_reserved.pack_propagate(False)
 
@@ -788,12 +786,6 @@ class WhiteboardApp:
             tip = getattr(export, "_tooltip", None)
             if tip is not None:
                 tip.set_text("Export board as PNG")
-        history = getattr(self, "history_btn", None)
-        if history is not None:
-            self._set_enabled(history, False)
-            tip = getattr(history, "_tooltip", None)
-            if tip is not None:
-                tip.set_text("Coming soon")
         self._update_host_buttons()
 
     def _set_tool(self, tool):
