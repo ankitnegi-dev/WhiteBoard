@@ -56,6 +56,7 @@ def test_shape_drag_preview_and_one_op(tk_root, kind, fill):
     app.net.sent.clear()
     start = _event_at(app, 100, 100)
     app._on_press(start)
+    app._on_motion(_event_at(app, 120, 110, 0))
     assert app._shape_preview is not None
 
     for point, state in (((130, 120), 0), ((160, 110), 1), ((190, 130), 0)):

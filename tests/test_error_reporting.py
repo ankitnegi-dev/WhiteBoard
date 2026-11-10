@@ -6,8 +6,6 @@ import logging
 import sys
 import time
 
-import pytest
-
 
 def test_report_exception_dedupes(tk_root):
     from client.ui import WhiteboardApp
@@ -30,7 +28,6 @@ def test_report_exception_dedupes(tk_root):
             self.errors.append((msg, args))
 
     fake = FakeLogger()
-    import client.ui as ui_module
 
     original_get_logger = logging.getLogger
 

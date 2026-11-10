@@ -2165,6 +2165,7 @@ class WhiteboardApp:
 
         if key not in self._ui_error_last_full:
             self._ui_error_last_full[key] = now
+            self._ui_error_last_summary = now
             logger.error("unhandled UI exception: %s",
                         "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
         elif (now - self._ui_error_last_summary) >= self._UI_ERROR_LOG_INTERVAL:
