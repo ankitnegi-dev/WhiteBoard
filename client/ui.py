@@ -1283,7 +1283,7 @@ class WhiteboardApp:
                     obj["y"] = self._drag_origin[1] + dy
                     item = self.canvas_items.pop(self._selected_sticky, None)
                     if item is not None:
-                        self.canvas.delete(item)
+                        self.canvas.delete(self._selected_sticky)
                     self._add_sticky_item(obj)
                     self._draw_selection()
         elif self.tool not in ("pen", "eraser", "text"):
@@ -1577,7 +1577,7 @@ class WhiteboardApp:
                 if isinstance(tid, str):
                     item = self.canvas_items.pop(tid, None)
                     if item is not None:
-                        self.canvas.delete(item)
+                        self.canvas.delete(tid)
                     self.state.objects.pop(tid, None)
                     if getattr(self, "_hover_erase", None) == tid:
                         self._hover_erase = None
@@ -1607,7 +1607,7 @@ class WhiteboardApp:
                     obj["text"] = msg.get("text", obj.get("text", ""))
                     item = self.canvas_items.pop(tid, None)
                     if item is not None:
-                        self.canvas.delete(item)
+                        self.canvas.delete(tid)
                     self._add_sticky_item(obj)
                 return
             if mtype == "move_object":
@@ -1618,7 +1618,7 @@ class WhiteboardApp:
                     obj["y"] = msg.get("y", obj.get("y", 0))
                     item = self.canvas_items.pop(tid, None)
                     if item is not None:
-                        self.canvas.delete(item)
+                        self.canvas.delete(tid)
                     self._add_sticky_item(obj)
                 return
             # Render remote stroke updates.
@@ -1666,7 +1666,7 @@ class WhiteboardApp:
                 if isinstance(tid, str):
                     item = self.canvas_items.pop(tid, None)
                     if item is not None:
-                        self.canvas.delete(item)
+                        self.canvas.delete(tid)
                     self.state.objects.pop(tid, None)
             elif action == "restore_object":
                 obj = msg.get("object")
@@ -1695,7 +1695,7 @@ class WhiteboardApp:
                 if isinstance(tid, str):
                     item = self.canvas_items.pop(tid, None)
                     if item is not None:
-                        self.canvas.delete(item)
+                        self.canvas.delete(tid)
                     self.state.objects.pop(tid, None)
             elif action == "add_object":
                 obj = msg.get("object")
@@ -1716,7 +1716,7 @@ class WhiteboardApp:
                     obj["text"] = msg.get("text")
                     item = self.canvas_items.pop(tid, None)
                     if item is not None:
-                        self.canvas.delete(item)
+                        self.canvas.delete(tid)
                     self._add_sticky_item(obj)
             elif action == "move_object":
                 tid = msg.get("target_id")
@@ -1728,7 +1728,7 @@ class WhiteboardApp:
                         obj["y"] = msg.get("y")
                     item = self.canvas_items.pop(tid, None)
                     if item is not None:
-                        self.canvas.delete(item)
+                        self.canvas.delete(tid)
                     self._add_sticky_item(obj)
             return
         if mtype == "redo":
@@ -1757,7 +1757,7 @@ class WhiteboardApp:
                     obj["text"] = msg.get("text")
                     item = self.canvas_items.pop(tid, None)
                     if item is not None:
-                        self.canvas.delete(item)
+                        self.canvas.delete(tid)
                     self._add_sticky_item(obj)
             elif action == "move_object":
                 tid = msg.get("target_id")
@@ -1769,28 +1769,28 @@ class WhiteboardApp:
                         obj["y"] = msg.get("y")
                     item = self.canvas_items.pop(tid, None)
                     if item is not None:
-                        self.canvas.delete(item)
+                        self.canvas.delete(tid)
                     self._add_sticky_item(obj)
             elif action == "remove_stroke":
                 tid = msg.get("target_id")
                 if isinstance(tid, str):
                     item = self.canvas_items.pop(tid, None)
                     if item is not None:
-                        self.canvas.delete(item)
+                        self.canvas.delete(tid)
                     self.state.objects.pop(tid, None)
             elif action == "remove_object":
                 tid = msg.get("target_id")
                 if isinstance(tid, str):
                     item = self.canvas_items.pop(tid, None)
                     if item is not None:
-                        self.canvas.delete(item)
+                        self.canvas.delete(tid)
                     self.state.objects.pop(tid, None)
             elif action == "remove_objects":
                 for tid in msg.get("target_ids", []):
                     if isinstance(tid, str):
                         item = self.canvas_items.pop(tid, None)
                         if item is not None:
-                            self.canvas.delete(item)
+                            self.canvas.delete(tid)
                         self.state.objects.pop(tid, None)
             return
         if mtype == "clear_canvas":
@@ -1938,7 +1938,7 @@ class WhiteboardApp:
         user = str(obj.get("user", ""))
         # Shadow.
         self.canvas.create_rectangle(x + 4, y + 4, x + width + 4, y + height + 4,
-                                    fill="#000000", outline="", stipple="gray25",
+                                    fill="#BFBFBF", outline="",
                                     tags=(sid,))
         item = self.canvas.create_rectangle(x, y, x + width, y + height,
                                             fill=color, outline="#8A7F68", width=2,
@@ -1987,7 +1987,7 @@ class WhiteboardApp:
         self.state.end_drawing(self.username)
         if self.net:
             self.net.send(msg)
-        self._open_sticky_editor(oid)
+        self._open_sticky_editor(oid, initial="")
 
     def _select_at(self, lx: float, ly: float) -> None:
         self.canvas.delete("sticky_selection")
@@ -2038,7 +2038,7 @@ class WhiteboardApp:
                 self._open_sticky_editor(oid)
                 return
 
-    def _open_sticky_editor(self, oid: str) -> None:
+    def _open_sticky_editor(self, oid: str, initial: Optional[str] = None) -> None:
         if self.role == "viewer":
             self._toast("Viewers cannot do this.")
             return
@@ -2055,14 +2055,17 @@ class WhiteboardApp:
         scale = self.scale
         width = int(220 * scale)
         height = int(160 * scale)
+        color = obj.get("color", "#FFF2A8")
         t = self.theme
-        entry = tk.Text(self.canvas, wrap="word", bg=t["surface"], fg=t["ink"],
-                        insertbackground=t["ink"], selectbackground=t["accent"],
+        entry = tk.Text(self.canvas, wrap="word", bg=color, fg="#222222",
+                        insertbackground="#222222", selectbackground=t["accent"],
                         selectforeground=t["on_accent"], borderwidth=1, relief="solid",
                         font=("Segoe UI", max(9, int(11 * scale))))
         entry.place(x=x + 8, y=y + 8, width=max(40, width - 16),
                    height=max(20, height - 28))
-        entry.insert("1.0", str(obj.get("text", "")))
+        if initial is None:
+            initial = str(obj.get("text", ""))
+        entry.insert("1.0", initial)
         entry.focus_set()
         self._sticky_editor = entry
 
@@ -2080,7 +2083,7 @@ class WhiteboardApp:
             obj["text"] = new_text
             item = self.canvas_items.pop(oid, None)
             if item is not None:
-                self.canvas.delete(item)
+                self.canvas.delete(oid)
             self._add_sticky_item(obj)
             self.state.track_pending(op_id)
             self._pending_ops[op_id] = msg
