@@ -70,12 +70,27 @@ def main(argv: Optional[list[str]] = None) -> int:
     setup_logging(args.log_level)
     log = logging.getLogger("server.main")
 
+    # In a frozen (PyInstaller) build, keep the default rooms folder next to
+    # the executable instead of in the temporary extraction directory.
+    if args.rooms_dir == "rooms" and getattr(sys, "frozen", False):
+        args.rooms_dir = os.path.join(os.path.dirname(sys.executable), "rooms")
+
     persistence.set_rooms_dir(args.rooms_dir)
 
     rm = RoomManager(grace_period=args.grace_period,
                      empty_room_grace=args.empty_room_grace)
 
-    sock = make_server_socket(args.host, args.port)
+    try:
+        sock = make_server_socket(args.host, args.port)
+    except OSError as exc:
+        message = f"Port {args.port} is already in use" if getattr(exc, "errno", None) in (98, 10048) else f"Could not start server: {exc}"
+        print(message)
+        log.error(message)
+        try:
+            input("Press Enter to exit...")
+        except EOFError:
+            pass
+        return 1
     log.info("server listening on %s:%d", args.host, args.port)
     for ip in platform_utils.get_lan_ips():
         log.info("LAN client target: %s:%d", ip, args.port)

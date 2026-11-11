@@ -10,13 +10,15 @@ __pycache__/
 venv/
 .pytest_cache/
 
-# PyInstaller output (anywhere in the repo)
+# Build outputs and release bundles
 dist/
 **/dist/
 *.spec
 .pyi_work/
 spike/build/
 spike/dist/
+release/
+build/whiteboard.ico
 
 # Top-level build/ holds our scripts, so only ignore generated stuff in it
 build/*
