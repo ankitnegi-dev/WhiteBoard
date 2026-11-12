@@ -120,3 +120,6 @@ cd spike
 
 On Linux use `.venv/bin/pyinstaller`. Run the resulting executable to
 confirm the canvas draws a line on mouse drag.
+
+## AUTHOR
+#ANKIT NEGI
