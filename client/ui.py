@@ -181,15 +181,93 @@ class WhiteboardApp:
         self.room_code_hint = ttk.Label(card, text="The server generates the room code for you.", font=("Segoe UI", 9, "italic"))
         self.room_code_hint.pack(pady=(4, 0))
 
-        self.connect_status = ttk.Label(card, text="", foreground="#B83A2E", font=("Segoe UI", 10))
+        self.connect_status = ttk.Label(card, text="", foreground="#B83A2E", font=("Segoe UI", 10), wraplength=360)
         self.connect_status.pack(pady=(12, 0))
 
         self.connect_button = ttk.Button(card, text="Create room", command=lambda: self._start_connect(self.connect_mode.get()))
         self.connect_button.pack(pady=(12, 0), ipadx=12, ipady=4)
 
+        self.rejoin_button = ttk.Button(card, text="Rejoin last room", command=self._rejoin_last_room)
+        self.rejoin_button.pack(pady=(8, 0), ipadx=12, ipady=4)
+        self._update_rejoin_button()
+
         self._update_connect_mode()
 
+    def _on_close(self) -> None:
+        self._connect_closed = True
+        stop = getattr(self, "_connect_stop", None)
+        if stop is not None:
+            try:
+                stop.set()
+            except Exception:
+                pass
+        try:
+            for aid in self.root.tk.call("after", "info"):
+                self.root.after_cancel(aid)
+        except (tk.TclError, RuntimeError):
+            pass
+        if getattr(self, "net", None) is not None:
+            try:
+                self.net.disconnect()
+            except Exception:
+                pass
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _update_rejoin_button(self) -> None:
+        try:
+            import client.session_store as session_store
+            entry = session_store.last_session()
+        except Exception:
+            entry = None
+        if not entry:
+            self.rejoin_button.state(["disabled"])
+            Tooltip(self.rejoin_button, "No saved room to rejoin")
+        else:
+            self.rejoin_button.state(["!disabled"])
+            Tooltip(self.rejoin_button, "Rejoin the most recent room")
+
+    def _rejoin_last_room(self) -> None:
+        try:
+            import client.session_store as session_store
+            entry = session_store.last_session()
+        except Exception:
+            entry = None
+        if not entry:
+            return
+        self.connect_mode.set("join")
+        self._update_connect_mode()
+
+        self.entry_host.delete(0, "end")
+        self.entry_host.insert(0, str(entry.get("server_host", "")))
+        self.entry_port.delete(0, "end")
+        self.entry_port.insert(0, str(entry.get("port", 5050)))
+        self.entry_username.delete(0, "end")
+        self.entry_username.insert(0, str(entry.get("username", "")))
+        self.entry_room_code.delete(0, "end")
+        self.entry_room_code.insert(0, str(entry.get("room_code", "")))
+        self._start_connect("join")
+
     def _update_connect_mode(self):
+        mode = self.connect_mode.get()
+        label = getattr(self, "label_room_code", None)
+        entry = getattr(self, "entry_room_code", None)
+        if mode == "create":
+            if label is not None:
+                label.grid_remove()
+            if entry is not None:
+                entry.grid_remove()
+            self.room_code_hint.config(text="The server generates the room code for you.")
+            self.connect_button.config(text="Create room")
+        else:
+            if label is not None:
+                label.grid(row=self.room_code_row, column=0, sticky="w", pady=4, padx=(0, 8))
+            if entry is not None:
+                entry.grid(row=self.room_code_row, column=1, pady=4)
+            self.room_code_hint.config(text="Enter the 6-character code from the host.")
+            self.connect_button.config(text="Join room")
         mode = self.connect_mode.get()
         label = getattr(self, "label_room_code", None)
         entry = getattr(self, "entry_room_code", None)
@@ -230,7 +308,7 @@ class WhiteboardApp:
             entry.delete(0, "end")
             entry.insert(0, value)
 
-    def _start_connect(self, mode: str) -> None:
+    def _start_connect(self, mode: str, timeout: float = 5.0) -> None:
         host = self.entry_host.get().strip()
         port_text = self.entry_port.get().strip()
         username = self.entry_username.get().strip()
@@ -259,34 +337,144 @@ class WhiteboardApp:
         self.connect_status.config(text="Connecting...")
         self.root.update_idletasks()
 
-        threading.Thread(target=self._connect_worker, args=(mode, host, port, username, room_code, password), daemon=True).start()
+        # Cancel any previous attempt.
+        if getattr(self, "_connect_stop", None) is not None:
+            self._connect_stop.set()
+        self._connect_stop = threading.Event()
+        self._connect_queue = queue.Queue()
+        self._connect_poll_ids = []
+        self._connect_thread = threading.Thread(
+            target=self._connect_worker,
+            args=(mode, host, port, username, room_code, password, timeout,
+                  self._connect_stop, self._connect_queue),
+            daemon=True,
+            name="connect-worker",
+        )
+        self._connect_thread.start()
+        if not getattr(self, "_connect_poll_scheduled", False):
+            self._connect_poll_scheduled = True
+            try:
+                pid = self.root.after(10, self._poll_connect)
+                self._connect_poll_ids.append(pid)
+            except (tk.TclError, RuntimeError):
+                pass
 
-    def _connect_worker(self, mode, host, port, username, room_code, password):
+    def _connect_worker(self, mode, host, port, username, room_code, password, timeout,
+                        stop_event, result_queue):
         try:
+            if stop_event.is_set():
+                result_queue.put(("cancelled",))
+                return
             net = NetworkClient(host, port)
-            net.connect()
+            net.connect(timeout=timeout, stop_event=stop_event)
+            if stop_event.is_set():
+                net.disconnect()
+                result_queue.put(("cancelled",))
+                return
             if mode == "create":
                 net.create_room(username, password if password else None)
+                resp = net.wait_for({"room_created", "join_ok", "join_denied", "_disconnected", "error"}, timeout=timeout)
+                if stop_event.is_set():
+                    net.disconnect()
+                    result_queue.put(("cancelled",))
+                    return
             else:
-                net.join_room(username, room_code, password if password else None)
-            resp = net.wait_for({"room_created", "join_ok", "join_denied", "_disconnected", "error"}, timeout=6.0)
+                entry = None
+                try:
+                    import client.session_store as session_store
+                    entry = session_store.find_session(host, port, room_code, username)
+                except Exception:
+                    entry = None
+                if entry is not None:
+                    net.reconnect(entry["token"], room_code, 0)
+                    resp = net.wait_for({"reconnect_ok", "reconnect_denied", "_disconnected", "error"}, timeout=timeout)
+                    if stop_event.is_set():
+                        net.disconnect()
+                        result_queue.put(("cancelled",))
+                        return
+                    if resp is not None and resp.get("type") == "reconnect_denied":
+                        try:
+                            session_store.remove_session(host, port, room_code, username)
+                        except Exception:
+                            pass
+                        net.join_room(username, room_code, password if password else None)
+                        resp = net.wait_for({"room_created", "join_ok", "join_denied", "_disconnected", "error"}, timeout=timeout)
+                else:
+                    net.join_room(username, room_code, password if password else None)
+                    resp = net.wait_for({"room_created", "join_ok", "join_denied", "_disconnected", "error"}, timeout=timeout)
+            if stop_event.is_set():
+                net.disconnect()
+                result_queue.put(("cancelled",))
+                return
             if resp is None:
                 net.disconnect()
-                self.root.after(0, self._connect_failed, "No response from server.")
+                result_queue.put(("error", "No response from server."))
                 return
-            self.root.after(0, self._handle_connect_result, mode, net, username, resp)
+            result_queue.put(("ok", mode, net, username, resp))
         except Exception as exc:
-            self.root.after(0, self._connect_failed, str(exc))
+            if "cancelled" in str(exc):
+                result_queue.put(("cancelled",))
+            else:
+                result_queue.put(("error", str(exc)))
 
     def _connect_failed(self, message: str) -> None:
-        self.connect_status.config(text=f"Connection failed: {message}")
+        try:
+            self.connect_status.config(text=f"Connection failed: {message}")
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _poll_connect(self) -> None:
+        if getattr(self, "_connect_closed", False):
+            return
+        try:
+            self._connect_poll_scheduled = False
+            try:
+                while True:
+                    item = self._connect_queue.get_nowait()
+                    kind = item[0]
+                    if kind == "ok":
+                        try:
+                            self._handle_connect_result(item[1], item[2], item[3], item[4])
+                        except (tk.TclError, RuntimeError):
+                            pass
+                    elif kind == "error":
+                        try:
+                            self._connect_failed(item[1])
+                        except (tk.TclError, RuntimeError):
+                            pass
+            except queue.Empty:
+                pass
+            thread = getattr(self, "_connect_thread", None)
+            if thread is not None and thread.is_alive() and not getattr(self, "_connect_closed", False):
+                self._connect_poll_scheduled = True
+                try:
+                    pid = self.root.after(10, self._poll_connect)
+                    self._connect_poll_ids.append(pid)
+                except (tk.TclError, RuntimeError):
+                    pass
+        except (tk.TclError, RuntimeError):
+            return
 
     def _handle_connect_result(self, mode, net, username, resp) -> None:
         mtype = resp.get("type")
         if mtype in ("join_denied", "error", "_disconnected"):
             net.disconnect()
-            reason = resp.get("message") or resp.get("reason") or "denied"
-            self.connect_status.config(text=f"Join denied: {reason}")
+            reason = resp.get("reason") or resp.get("reason") or "denied"
+            message = resp.get("message") or reason
+            if reason == "username_reserved":
+                try:
+                    import client.session_store as session_store
+                    params = getattr(self, "_connect_params", {}) or {}
+                    has_entry = session_store.find_session(
+                        params.get("host", ""), int(params.get("port", 5050)),
+                        params.get("room_code", ""), params.get("username", "")) is not None
+                except Exception:
+                    has_entry = False
+                if not has_entry:
+                    remaining = resp.get("remaining_grace", 0)
+                    message = ("That name is reserved for a participant who left recently. "
+                               f"If it is you, wait {int(remaining)} seconds or ask the host to remove your slot.")
+            self.connect_status.config(text=f"Join denied: {message}")
             return
 
         self.net = net
@@ -300,8 +488,29 @@ class WhiteboardApp:
             self.role = resp.get("role", "host")
             self.token = resp.get("token", self.token)
             # Host color: look it up once participants arrive; default accent.
-            self.user_color = "#1E5B6B"
-        elif mtype == "join_ok":
+        elif mtype == "reconnect_ok":
+            self.room_code = resp.get("room_code", self.room_code or self.entry_room_code.get().strip().upper())
+            self.role = resp.get("role", self.role)
+            if isinstance(resp.get("participants"), list):
+                for u in resp["participants"]:
+                    if u.get("name") == self.username:
+                        self.user_color = u.get("color", self.user_color)
+                        self.role = u.get("role", self.role)
+            snap = resp.get("snapshot")
+            if isinstance(snap, dict):
+                self.state.apply_snapshot(snap)
+            ops_since = resp.get("ops_since")
+            if isinstance(ops_since, dict):
+                ops = ops_since.get("ops", [])
+                if isinstance(ops, list):
+                    self.state.apply_ops_since(int(ops_since.get("from_seq", self.state.applied_seq)), ops)
+            if isinstance(resp.get("chat_history"), list):
+                self.state.apply_chat_history(resp["chat_history"])
+            if isinstance(resp.get("participants"), list):
+                self.state.update_participants(resp["participants"])
+            self._rebuild_participants()
+
+        if mtype == "join_ok":
             self.room_code = resp.get("room_code", self.entry_room_code.get().strip().upper())
             # room code may not be in join_ok; keep from entry
             if not self.room_code:
@@ -322,7 +531,24 @@ class WhiteboardApp:
 
         self.root.title(f"LAN Whiteboard - {self.username} ({self.role}) - Room {self.room_code}")
 
-        # Remove connect screen.
+        self.root.title(f"LAN Whiteboard - {self.username} ({self.role}) - Room {self.room_code}")
+
+        # Persist the reconnect token (never the password).
+        try:
+            import client.session_store as session_store
+            params = getattr(self, "_connect_params", {}) or {}
+            host = params.get("host", "")
+            port = int(params.get("port", 5050))
+            session_store.record_session({
+                "server_host": host,
+                "port": port,
+                "room_code": self.room_code,
+                "username": self.username,
+                "token": self.token,
+                "role": self.role,
+            })
+        except Exception:
+            pass
         self.connect_frame.destroy()
         self._build_main()
         self._apply_theme()
@@ -358,46 +584,77 @@ class WhiteboardApp:
         self.local_strokes.clear()
         if self.reconnect_banner is not None:
             self.reconnect_banner.config(text="Reconnecting...")
-            self.reconnect_banner.pack(side="top", fill="x")
-        self._schedule_reconnect()
+        self._reconnect_queue = queue.Queue()
+        self._reconnect_stop = threading.Event()
+        self._reconnect_thread = threading.Thread(
+            target=self._reconnect_worker,
+            args=(self._connect_params or {}, self._reconnect_stop, self._reconnect_queue),
+            daemon=True, name="reconnect-worker")
+        self._reconnect_thread.start()
+        self.root.after(10, self._poll_reconnect)
 
-    def _schedule_reconnect(self) -> None:
-        if self._reconnect_after_id is not None:
-            try:
-                self.root.after_cancel(self._reconnect_after_id)
-            except Exception:
-                pass
-        delay_ms = int(self._reconnect_backoff * 1000)
-        self._reconnect_after_id = self.root.after(delay_ms, self._reconnect_step)
-
-    def _reconnect_step(self) -> None:
-        self._reconnect_after_id = None
-        if not self._reconnecting or self._connect_params is None:
+    def _poll_reconnect(self) -> None:
+        if getattr(self, "_connect_closed", False):
             return
-        params = self._connect_params
-        threading.Thread(target=self._reconnect_worker, args=(params,), daemon=True).start()
-
-    def _reconnect_worker(self, params: dict[str, Any]) -> None:
         try:
+            while True:
+                item = self._reconnect_queue.get_nowait()
+                kind = item[0]
+                if kind == "ok":
+                    try:
+                        self._handle_reconnect_result(item[1], item[2])
+                    except (tk.TclError, RuntimeError):
+                        pass
+                elif kind == "error":
+                    try:
+                        self._reconnect_failed(item[1])
+                    except (tk.TclError, RuntimeError):
+                        pass
+        except queue.Empty:
+            pass
+        thread = getattr(self, "_reconnect_thread", None)
+        if thread is not None and thread.is_alive() and not getattr(self, "_connect_closed", False):
+            try:
+                self.root.after(10, self._poll_reconnect)
+            except (tk.TclError, RuntimeError):
+                pass
+
+
+    def _reconnect_worker(self, params, stop_event, result_queue):
+        try:
+            if stop_event.is_set():
+                result_queue.put(("cancelled",))
+                return
             net = NetworkClient(params["host"], params["port"])
-            net.connect()
+            net.connect(timeout=5.0, stop_event=stop_event)
+            if stop_event.is_set():
+                net.disconnect()
+                result_queue.put(("cancelled",))
+                return
             last_seq = self.state.applied_seq
             net.send({"type": "reconnect", "token": self.token,
-                      "room_code": self.room_code, "last_seq": last_seq})
+                      "room_code": params["room_code"], "last_seq": last_seq})
             resp = net.wait_for({"reconnect_ok", "reconnect_denied", "_disconnected", "error"}, timeout=6.0)
+            if stop_event.is_set():
+                net.disconnect()
+                result_queue.put(("cancelled",))
+                return
             if resp is None:
                 net.disconnect()
-                self.root.after(0, self._reconnect_failed, "No response from server.")
+                result_queue.put(("error", "No response from server."))
                 return
-            self.root.after(0, self._handle_reconnect_result, net, resp)
+            result_queue.put(("ok", net, resp))
         except Exception as exc:
-            self.root.after(0, self._reconnect_failed, str(exc))
+            if "cancelled" in str(exc):
+                result_queue.put(("cancelled",))
+            else:
+                result_queue.put(("error", str(exc)))
 
     def _reconnect_failed(self, message: str) -> None:
         if not self._reconnecting:
             return
         self._reconnect_backoff = min(self._reconnect_backoff * 2, 10.0)
-        self._schedule_reconnect()
+        self.root.after(int(self._reconnect_backoff * 1000), self._begin_reconnect)
 
     def _handle_reconnect_result(self, net: NetworkClient, resp: dict[str, Any]) -> None:
         mtype = resp.get("type")
@@ -412,7 +669,6 @@ class WhiteboardApp:
             return
 
         self.net = net
-        # Apply state.
         if isinstance(resp.get("snapshot"), dict):
             self.state.apply_snapshot(resp["snapshot"])
             if isinstance(resp.get("chat_history"), list):
@@ -422,28 +678,14 @@ class WhiteboardApp:
             ops = osi.get("ops", [])
             if isinstance(ops, list):
                 self.state.apply_ops_since(int(osi.get("from_seq", self.state.applied_seq)), ops)
-        if isinstance(resp.get("seq"), int) and not isinstance(resp.get("seq"), bool):
-            if resp["seq"] > self.state.applied_seq:
-                self.state.applied_seq = resp["seq"]
         if isinstance(resp.get("participants"), list):
             self.state.update_participants(resp["participants"])
-            for u in resp["participants"]:
-                if u.get("name") == self.username and u.get("color"):
-                    self.user_color = u.get("color")
-        # Resend pending ops.
-        for op_id, msg in list(self._pending_ops.items()):
-            self.net.send(msg)
-        # Redraw.
+        self._rebuild_participants()
         self._redraw_all()
-        if self.reconnect_banner is not None:
-            self.reconnect_banner.pack_forget()
+        self.reconnect_banner.pack_forget() if self.reconnect_banner is not None else None
         self._reconnecting = False
         self._reconnect_backoff = 1.0
-        self._sync_state = "synced"
-        self._resync_pending = False
-        self.state.behind_since = None
         self.root.after(10, self._poll)
-        self.root.after(30000, self._board_hash_check)
 
     def _return_to_connect(self, message: str) -> None:
         self._reconnecting = False

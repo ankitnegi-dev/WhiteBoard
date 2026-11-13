@@ -35,10 +35,18 @@ class NetworkClient:
     # ------------------------------------------------------------------ #
     # Connection
     # ------------------------------------------------------------------ #
-    def connect(self, timeout: float = 5.0) -> None:
+    def connect(self, timeout: float = 5.0, stop_event: Optional[threading.Event] = None) -> None:
         """Blocking connect. Raises on failure. Starts worker threads."""
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("cancelled")
         sock = socket.create_connection((self.host, self.port), timeout=timeout)
         sock.settimeout(None)
+        if stop_event is not None and stop_event.is_set():
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise RuntimeError("cancelled")
         self.sock = sock
         self.connected = True
         self._stop.clear()
@@ -73,6 +81,9 @@ class NetworkClient:
 
     def join_room(self, username: str, room_code: str, password: Optional[str] = None) -> None:
         self.send({"type": "join_room", "username": username, "room_code": room_code, "password": password})
+
+    def reconnect(self, token: str, room_code: str, last_seq: int = 0) -> None:
+        self.send({"type": "reconnect", "token": token, "room_code": room_code, "last_seq": last_seq})
 
     def wait_for(self, types: set[str], timeout: float = 5.0) -> Optional[dict[str, Any]]:
         """Block until a message whose type is in ``types`` arrives."""

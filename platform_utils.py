@@ -8,6 +8,7 @@ file change.
 
 from __future__ import annotations
 
+import os
 import platform
 import socket
 from typing import List
@@ -62,3 +63,16 @@ def get_lan_ips() -> List[str]:
     if not found:
         found.add("127.0.0.1")
     return sorted(found)
+
+
+def user_config_dir(app_name: str = "lanwhiteboard") -> str:
+    """Return a per-user config directory for the whiteboard."""
+    if is_windows():
+        base = os.environ.get("APPDATA")
+        if not base:
+            base = os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+        return os.path.join(base, "LANWhiteboard")
+    base = os.environ.get("XDG_CONFIG_HOME")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, app_name)
