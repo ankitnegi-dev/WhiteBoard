@@ -374,6 +374,21 @@ def handle_client(
                 if p.kick is not None:
                     p.kick()
                 continue
+            elif mtype == "remove_participant":
+                if state.get("role") != "host":
+                    enqueue({"type": "error", "code": "forbidden", "message": "only the host can remove participants"})
+                    continue
+                target = msg.get("target")
+                if not isinstance(target, str) or not target.strip():
+                    enqueue({"type": "error", "code": "bad_request", "message": "target required"})
+                    continue
+                target = target.strip()
+                ok, reason = room.remove_participant(target)
+                if not ok:
+                    enqueue({"type": "error", "code": "rejected_remove", "message": reason})
+                    continue
+                room.broadcast({"type": "participant_list", "users": room.participant_list()})
+                continue
             elif mtype == "lock_room":
                 if state.get("role") != "host":
                     enqueue({"type": "error", "code": "forbidden", "message": "only the host can lock the room"})
@@ -526,12 +541,23 @@ def _handle_join_room(msg, state, rm, enqueue, log, peer) -> None:
                    and now - p.disconnected_at > rm.grace_period]
         for u in expired:
             room.participants.pop(u, None)
+        # Prune removed (freed) slots whose grace period expired.
+        for token, p in list(room.removed_participants.items()):
+            if p.disconnected_at is not None and now - p.disconnected_at > rm.grace_period:
+                room.removed_participants.pop(token, None)
 
     with room.lock:
         if room.locked:
             enqueue({"type": "join_denied", "reason": "room_locked", "message": "room is locked"})
             return
         if username in room.participants:
+            participant = room.participants[username]
+            if not participant.online:
+                remaining = room._grace_remaining(participant, now)
+                enqueue({"type": "join_denied", "reason": "username_reserved",
+                         "message": f"That name is reserved for a participant who left recently. If it is you, use Rejoin last room. Otherwise try again in {int(remaining)} seconds or pick another name.",
+                         "remaining_grace": remaining})
+                return
             enqueue({"type": "join_denied", "reason": "username_taken", "message": "username already in room"})
             return
         if not room.check_password(password if isinstance(password, str) else None):
@@ -603,6 +629,10 @@ def _handle_reconnect(msg, state, rm, enqueue, log, peer) -> None:
                    and now - p.disconnected_at > rm.grace_period]
         for u in expired:
             room.participants.pop(u, None)
+        # Prune removed (freed) slots whose grace period expired.
+        for token, p in list(room.removed_participants.items()):
+            if p.disconnected_at is not None and now - p.disconnected_at > rm.grace_period:
+                room.removed_participants.pop(token, None)
 
     # Kicked tokens are remembered even after the participant is removed.
     with room.lock:
@@ -621,6 +651,11 @@ def _handle_reconnect(msg, state, rm, enqueue, log, peer) -> None:
             if p.token == token:
                 participant = p
                 break
+        if participant is None:
+            for p in room.removed_participants.values():
+                if p.token == token:
+                    participant = p
+                    break
 
     if participant is None:
         enqueue({"type": "reconnect_denied", "reason": "invalid_token", "message": "unknown token"})
@@ -628,12 +663,22 @@ def _handle_reconnect(msg, state, rm, enqueue, log, peer) -> None:
     if participant.kicked:
         enqueue({"type": "reconnect_denied", "reason": "kicked", "message": "you were kicked"})
         return
+    now = time.time()
     if (not participant.online) and participant.disconnected_at is not None \
             and now - participant.disconnected_at > rm.grace_period:
         with room.lock:
+            room.removed_participants.pop(participant.token, None)
             room.participants.pop(participant.username, None)
         enqueue({"type": "reconnect_denied", "reason": "token_expired", "message": "reconnection grace period expired"})
         return
+
+    # If the slot was freed, restore it now.
+    with room.lock:
+        if participant.username in room.participants and room.participants[participant.username] is not participant:
+            enqueue({"type": "reconnect_denied", "reason": "username_taken", "message": "that name is now in use"})
+            return
+        room.removed_participants.pop(participant.token, None)
+        room.participants[participant.username] = participant
 
     # Replace old socket if still half-open.
     old_state = participant.state

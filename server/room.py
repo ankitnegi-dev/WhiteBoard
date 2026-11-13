@@ -83,6 +83,8 @@ class Room:
         self.dirty: bool = False
         self.empty_since: Optional[float] = None
         self.kicked_tokens: set[str] = set()
+        self.removed_participants: Dict[str, Participant] = {}
+        self.grace_period: float = 120.0
 
     def has_password(self) -> bool:
         return self.password_hash is not None
@@ -98,10 +100,15 @@ class Room:
         return verify_password(password, self.password_salt, self.password_hash)
 
     def participant_list(self) -> List[dict[str, Any]]:
-        return [
-            {"name": p.username, "color": p.color, "role": p.role, "online": p.online}
-            for p in self.participants.values()
-        ]
+        now = time.time()
+        result = []
+        for p in self.participants.values():
+            item = {"name": p.username, "color": p.color, "role": p.role, "online": p.online}
+            if not p.online and p.disconnected_at is not None:
+                remaining = self._grace_remaining(p, now)
+                item["reserved_for"] = remaining
+            result.append(item)
+        return result
 
     def broadcast(self, msg: dict[str, Any], exclude: Optional[str] = None) -> None:
         for username, p in list(self.participants.items()):
@@ -109,6 +116,27 @@ class Room:
                 continue
             if p.online and p.send is not None:
                 p.send(msg)
+
+    def _grace_remaining(self, p: Participant, now: Optional[float] = None) -> float:
+        if now is None:
+            now = time.time()
+        if p.disconnected_at is None:
+            return float(self.grace_period)
+        return max(0.0, self.grace_period - (now - p.disconnected_at))
+
+    def remove_participant(self, target: str) -> Tuple[bool, str]:
+        with self.lock:
+            p = self.participants.get(target)
+            if p is None:
+                return False, "target_not_found"
+            if p.online:
+                return False, "target_online"
+            if p.disconnected_at is None:
+                p.disconnected_at = time.time()
+            if p.token:
+                self.removed_participants[p.token] = p
+            del self.participants[target]
+            return True, ""
 
     def next_color(self) -> str:
         return USER_COLORS[len(self.participants) % len(USER_COLORS)]

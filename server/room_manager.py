@@ -35,6 +35,7 @@ class RoomManager:
             if code in self._rooms:
                 raise ValueError(f"room code already exists: {code}")
             room = Room(code)
+            room.grace_period = self.grace_period
             if password:
                 from server.auth import hash_password
 

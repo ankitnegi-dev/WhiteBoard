@@ -32,7 +32,7 @@ Example:
 ### Connection and session
 
 - create_room {username, password?} -> room_created {room_code, token, role: host}
-- join_room {username, room_code, password?} -> join_ok {token, role, user_color, participants, snapshot, seq, chat_history} or join_denied {reason, message}. Reasons: room_not_found, room_locked, username_taken, wrong_password, bad_request
+- join_room {username, room_code, password?} -> join_ok {token, role, user_color, participants, snapshot, seq, chat_history} or join_denied {reason, message, remaining_grace?}. Reasons: room_not_found, room_locked, username_taken, username_reserved, wrong_password, bad_request, too_many_attempts
 - reconnect {token, room_code, last_seq} -> reconnect_ok {ops_since or snapshot, seq} or reconnect_denied {reason, message}. Reasons: invalid_token, token_expired, room_gone, kicked, bad_request
 - leave
 - ping / pong (heartbeat; pong echoes the ping's ts for RTT)
@@ -44,6 +44,8 @@ Example:
 - participant_list {users: [{name, color, role, online}]}
 - role_change {target, role} (host only)
 - kick {target} (host only)
+- remove_participant {target} (host only; frees an offline participant's
+  reserved slot without blocking a later reconnect with a valid token)
 - lock_room {locked} (host only)
 - cursor_move {x, y} (throttled to about 20 per second, not logged)
 

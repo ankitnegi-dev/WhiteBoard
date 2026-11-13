@@ -666,10 +666,14 @@ class WhiteboardApp:
             self.kick_btn = ttk.Button(hc, text="Kick", command=self._kick_user)
             self.kick_btn.grid(row=3, column=0, columnspan=2, pady=4, sticky="ew")
             Tooltip(self.kick_btn, "Host only")
+            self.remove_btn = ttk.Button(hc, text="Remove", command=self._remove_participant)
+            self.remove_btn.grid(row=4, column=0, columnspan=2, pady=4, sticky="ew")
+            Tooltip(self.remove_btn, "Free an offline participant's slot")
             self.apply_role_btn.state(["disabled"])
             self.kick_btn.state(["disabled"])
+            self.remove_btn.state(["disabled"])
             self.lock_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(hc, text="Lock room", variable=self.lock_var, command=self._toggle_lock).grid(row=4, column=0, columnspan=2, sticky="w")
+            ttk.Checkbutton(hc, text="Lock room", variable=self.lock_var, command=self._toggle_lock).grid(row=5, column=0, columnspan=2, sticky="w")
 
         # Chat takes the remaining vertical space; the input is reserved at
         # the bottom first so it stays visible at the minimum window height.
@@ -2505,7 +2509,7 @@ class WhiteboardApp:
             self._participant_rows = {}
             self._participant_signature = None
 
-        signature = tuple((u.get("name"), u.get("role"), u.get("online"), u.get("color")) for u in self.state.participants)
+        signature = tuple((u.get("name"), u.get("role"), u.get("online"), u.get("color"), u.get("reserved_for")) for u in self.state.participants)
         if hasattr(self, "host_target"):
             names = [u.get("name", "") for u in self.state.participants if u.get("name") != self.username]
             if tuple(self.host_target["values"]) != tuple(names):
@@ -2542,6 +2546,10 @@ class WhiteboardApp:
             status = "" if online else " (offline)"
             name_label = ttk.Label(row, text=f"{name}{suffix}  [{role}]{status}")
             name_label.pack(side="left")
+            if not online:
+                remaining = u.get("reserved_for")
+                if remaining is not None:
+                    Tooltip(name_label, f"{name} is offline; slot reserved for {int(remaining)} s")
             # Reserved slot for the drawing indicator (fixed width).
             draw_label = ttk.Label(row, text="", width=10)
             draw_label.pack(side="left")
@@ -2649,9 +2657,22 @@ class WhiteboardApp:
         if self.host_target.get().strip():
             self.apply_role_btn.state(["!disabled"])
             self.kick_btn.state(["!disabled"])
+            if hasattr(self, "remove_btn"):
+                # Enable removal only for offline (reserved) participants.
+                target = self.host_target.get().strip()
+                offline = False
+                for u in self.state.participants:
+                    if u.get("name") == target and not u.get("online", True):
+                        offline = True
+                if offline:
+                    self.remove_btn.state(["!disabled"])
+                else:
+                    self.remove_btn.state(["disabled"])
         else:
             self.apply_role_btn.state(["disabled"])
             self.kick_btn.state(["disabled"])
+            if hasattr(self, "remove_btn"):
+                self.remove_btn.state(["disabled"])
 
     def _apply_role(self):
         if not self.net or self.role != "host":
@@ -2667,6 +2688,13 @@ class WhiteboardApp:
         target = self.host_target.get().strip()
         if target:
             self.net.send({"type": "kick", "target": target})
+
+    def _remove_participant(self):
+        if not self.net or self.role != "host":
+            return
+        target = self.host_target.get().strip()
+        if target:
+            self.net.send({"type": "remove_participant", "target": target})
 
     def _toggle_lock(self):
         if self.net and self.role == "host":
