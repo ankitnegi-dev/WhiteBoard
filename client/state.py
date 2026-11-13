@@ -168,6 +168,22 @@ class BoardState:
                 }
             self.start_drawing(user if isinstance(user, str) else "")
             self.end_drawing(user if isinstance(user, str) else "")
+        elif mtype == "text":
+            oid = op.get("obj_id")
+            if isinstance(oid, str):
+                self.objects[oid] = {
+                    "id": oid,
+                    "type": "text",
+                    "x": op.get("x", 0),
+                    "y": op.get("y", 0),
+                    "text": op.get("text", ""),
+                    "size": op.get("size", 12),
+                    "color": op.get("color", "#000000"),
+                    "user": user,
+                    "seq": op.get("seq", 0),
+                }
+            self.start_drawing(user if isinstance(user, str) else "")
+            self.end_drawing(user if isinstance(user, str) else "")
         elif mtype == "sticky":
             oid = op.get("obj_id")
             if isinstance(oid, str):
@@ -282,6 +298,9 @@ class BoardState:
     def is_pending(self, op_id: Optional[str]) -> bool:
         return isinstance(op_id, str) and op_id in self.pending_op_ids
 
-    def clear_pending(self, op_id: Optional[str]) -> None:
-        if isinstance(op_id, str):
-            self.pending_op_ids.discard(op_id)
+    def board_hash(self) -> tuple[int, str]:
+        import hashlib
+        import json
+        payload = json.dumps(sorted(self.objects.values(), key=lambda o: o.get("id", "")),
+                             sort_keys=True)
+        return self.applied_seq, hashlib.sha256(payload.encode()).hexdigest()

@@ -68,7 +68,10 @@ Example:
 
 - snapshot {seq, objects, chat_tail}
 - ops_since {from_seq, ops: [...]}
-- resync_request {last_seq}
+- board_hash_request {seq, hash} / board_hash {seq, hash}: periodic
+  consistency check. The client sends its applied seq and board hash; the
+  server replies with its own. If the seq values match but the hashes differ,
+  the client requests a snapshot.
 
 ### Chat
 
@@ -133,7 +136,15 @@ Example:
   further broadcasts may be dropped for it, and it is expected to send
   resync_request (or reconnect) to catch up. Other clients are not stalled.
 
-### Undo and redo semantics
+### Client apply rules
+
+- Optimistic apply, reconciled by op_id: stroke_start, stroke_points, stroke_end,
+  shape, text, sticky, edit_object, move_object. The client renders locally
+  right away and ignores its own server echo by op_id.
+- Apply the server echo: delete_object, undo, redo, clear_canvas. The client
+  does not mutate the board on send; it waits for the broadcast so the sender
+  and every other client use the same code path.
+- cursor_move and chat are not part of the board state.
 
 - Undo is per user: it reverts the calling user's most recent active
   operation. It never undoes someone else's work.

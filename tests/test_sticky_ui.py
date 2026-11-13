@@ -70,6 +70,21 @@ def test_sticky_double_click_edit_queues_edit_object(tk_root):
     assert edits[0]["text"] == "new text"
 
 
+def test_sticky_editor_colors_and_empty(tk_root):
+    app = _build_app(tk_root)
+    app.state.objects["note1"] = {"id": "note1", "type": "sticky", "x": 100, "y": 100,
+                                  "text": "old", "color": "#FFF2A8", "width": 220,
+                                  "height": 160, "user": "host", "seq": 1}
+    app._add_sticky_item(app.state.objects["note1"])
+    tk_root.update()
+
+    app._open_sticky_editor("note1", initial="")
+    assert app._sticky_editor is not None
+    assert app._sticky_editor.cget("bg") == "#FFF2A8"
+    assert app._sticky_editor.cget("fg") == "#222222"
+    assert app._sticky_editor.get("1.0", "end-1c") == ""
+
+
 def test_select_drag_sends_one_move_object(tk_root):
     app = _build_app(tk_root)
     app.state.objects["note1"] = {"id": "note1", "type": "sticky", "x": 100, "y": 100,

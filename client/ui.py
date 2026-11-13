@@ -332,6 +332,7 @@ class WhiteboardApp:
             self._redraw_all()
 
         self.root.after(10, self._poll)
+        self.root.after(30000, self._board_hash_check)
 
     # ------------------------------------------------------------------ #
     # Reconnection
@@ -442,6 +443,7 @@ class WhiteboardApp:
         self._resync_pending = False
         self.state.behind_since = None
         self.root.after(10, self._poll)
+        self.root.after(30000, self._board_hash_check)
 
     def _return_to_connect(self, message: str) -> None:
         self._reconnecting = False
@@ -1327,6 +1329,14 @@ class WhiteboardApp:
             return
         if not self.net or sid == getattr(self, "_last_erased", None):
             return
+        # Remove locally right away so the sender converges with the server
+        # instead of waiting for (and then skipping) its own echo.
+        item = self.canvas_items.pop(sid, None)
+        if item is not None:
+            self.canvas.delete(sid)
+        self.state.objects.pop(sid, None)
+        if getattr(self, "_hover_erase", None) == sid:
+            self._hover_erase = None
         op_id = str(uuid.uuid4())
         self._last_delete = {"op_id": op_id, "target_id": sid}
         msg = {"type": "delete_object", "op_id": op_id, "target_id": sid}
@@ -1341,9 +1351,14 @@ class WhiteboardApp:
             if getattr(self, "_selected_sticky", None) is not None and getattr(self, "_drag_origin", None) is not None:
                 obj = self.state.objects.get(self._selected_sticky)
                 if isinstance(obj, dict):
-                    self.net.send({"type": "move_object", "op_id": str(__import__("uuid").uuid4()),
-                                    "target_id": self._selected_sticky,
-                                    "x": obj.get("x"), "y": obj.get("y")})
+                    op_id = str(__import__("uuid").uuid4())
+                    msg = {"type": "move_object", "op_id": op_id,
+                           "target_id": self._selected_sticky,
+                           "x": obj.get("x"), "y": obj.get("y")}
+                    self.state.track_pending(op_id)
+                    self._pending_ops[op_id] = msg
+                    if self.net:
+                        self.net.send(msg)
             self._drag_origin = None
             self._drag_start = None
             return
@@ -1435,6 +1450,12 @@ class WhiteboardApp:
     # ------------------------------------------------------------------ #
     # Polling and message handling
     # ------------------------------------------------------------------ #
+    def _board_hash_check(self) -> None:
+        if self.net is not None:
+            seq, digest = self.state.board_hash()
+            self.net.send({"type": "board_hash_request", "seq": seq, "hash": digest})
+        self.root.after(30000, self._board_hash_check)
+
     def _poll(self) -> None:
         if self.net is None:
             if self._reconnecting:
@@ -1554,7 +1575,7 @@ class WhiteboardApp:
             self._update_cursor(msg)
             return
         if mtype in ("stroke_start", "stroke_points", "stroke_end", "delete_object",
-                     "shape", "text"):
+                     "shape", "text", "sticky", "edit_object", "move_object"):
             op_id = msg.get("op_id")
             if self.state.is_pending(op_id):
                 self.state.clear_pending(op_id)
@@ -1641,7 +1662,20 @@ class WhiteboardApp:
                 # Redraw to be safe.
                 self._redraw_all()
             return
-        if mtype == "reconnect_ok":
+        if mtype == "board_hash":
+            server_seq = msg.get("seq")
+            server_hash = msg.get("hash")
+            client_seq, client_hash = self.state.board_hash()
+            if (isinstance(server_seq, int) and server_seq == client_seq and
+                    isinstance(server_hash, str) and server_hash != client_hash):
+                import logging
+                logging.getLogger("whiteboard.ui").warning(
+                    "board hash mismatch at seq %s", server_seq)
+                self._sync_state = "out of sync"
+                if self.net:
+                    self.net.send({"type": "resync_request", "last_seq": self.state.applied_seq})
+                self._toast("Board out of sync; resyncing")
+            return
             self._handle_reconnect_ok(msg)
             return
         if mtype == "reconnect_denied":
@@ -1660,6 +1694,15 @@ class WhiteboardApp:
             self._redraw_all()
             return
         if mtype == "undo":
+            status = self.state.apply_op(msg)
+            if status == "gap":
+                self._sync_state = "syncing"
+                self._resync_pending = True
+                if self.net:
+                    self.net.send({"type": "resync_request", "last_seq": self.state.applied_seq})
+                return
+            if status == "duplicate":
+                return
             action = msg.get("action")
             if action == "remove_stroke":
                 tid = msg.get("target_id")
@@ -1732,6 +1775,15 @@ class WhiteboardApp:
                     self._add_sticky_item(obj)
             return
         if mtype == "redo":
+            status = self.state.apply_op(msg)
+            if status == "gap":
+                self._sync_state = "syncing"
+                self._resync_pending = True
+                if self.net:
+                    self.net.send({"type": "resync_request", "last_seq": self.state.applied_seq})
+                return
+            if status == "duplicate":
+                return
             action = msg.get("action")
             if action == "add_stroke":
                 obj = msg.get("object")
@@ -1794,6 +1846,15 @@ class WhiteboardApp:
                         self.state.objects.pop(tid, None)
             return
         if mtype == "clear_canvas":
+            status = self.state.apply_op(msg)
+            if status == "gap":
+                self._sync_state = "syncing"
+                self._resync_pending = True
+                if self.net:
+                    self.net.send({"type": "resync_request", "last_seq": self.state.applied_seq})
+                return
+            if status == "duplicate":
+                return
             self.state.objects.clear()
             self.state.clear_drawers()
             self._redraw_all()
@@ -2261,6 +2322,10 @@ class WhiteboardApp:
             h = float(obj.get("height", 160))
             if x <= lx <= x + w and y <= ly <= y + h:
                 if self.net and oid != getattr(self, "_last_erased", None):
+                    item = self.canvas_items.pop(oid, None)
+                    if item is not None:
+                        self.canvas.delete(oid)
+                    self.state.objects.pop(oid, None)
                     self.net.send({"type": "delete_object", "op_id": str(__import__("uuid").uuid4()),
                                     "target_id": oid})
                     self._last_erased = oid

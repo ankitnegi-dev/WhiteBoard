@@ -319,6 +319,10 @@ def handle_client(
                     continue
                 room.broadcast(op)
                 continue
+            elif mtype == "board_hash_request":
+                seq, digest = room.board_hash()
+                enqueue({"type": "board_hash", "seq": seq, "hash": digest})
+                continue
             elif mtype == "clear_canvas":
                 if state.get("role") != "host":
                     enqueue({"type": "error", "code": "forbidden", "message": "only the host can clear the canvas"})

@@ -352,6 +352,7 @@ class Room:
                     "width": msg["width"],
                     "fill": msg.get("fill", None),
                     "user": username,
+                    "seq": self.seq + 1,
                 }
                 self.objects[sid] = obj
                 self.redo_stacks.pop(username, None)
@@ -371,6 +372,7 @@ class Room:
                     "size": msg["size"],
                     "color": msg["color"],
                     "user": username,
+                    "seq": self.seq + 1,
                 }
                 self.objects[oid] = obj
                 self.redo_stacks.pop(username, None)
@@ -391,6 +393,7 @@ class Room:
                     "width": STICKY_WIDTH,
                     "height": STICKY_HEIGHT,
                     "user": username,
+                    "seq": self.seq + 1,
                 }
                 self.objects[oid] = obj
                 self.redo_stacks.pop(username, None)
@@ -435,8 +438,11 @@ class Room:
             self.op_log.append(op)
             self.dirty = True
             # Attach seq to the object for snapshots.
-            if mtype in ("stroke_start", "stroke_points", "stroke_end", "sticky"):
-                obj = self.objects.get(msg.get("stroke_id"))
+            if mtype in ("stroke_start", "shape", "text", "sticky"):
+                id_key = {"stroke_start": "stroke_id", "stroke_points": "stroke_id",
+                          "stroke_end": "stroke_id", "shape": "shape_id",
+                          "text": "obj_id", "sticky": "obj_id"}[mtype]
+                obj = self.objects.get(msg.get(id_key))
                 if obj is not None:
                     obj["seq"] = self.seq
             return "ok", op, ""
@@ -649,6 +655,14 @@ class Room:
                 return None
             ops = [op for op in self.op_log if op["seq"] > from_seq]
             return {"from_seq": from_seq, "ops": ops}
+
+    def board_hash(self) -> tuple[int, str]:
+        import hashlib
+        import json
+        with self.lock:
+            payload = json.dumps(sorted(self.objects.values(), key=lambda o: o.get("id", "")),
+                                 sort_keys=True)
+            return self.seq, hashlib.sha256(payload.encode()).hexdigest()
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
