@@ -292,6 +292,10 @@ class BoardState:
         seq = op.get("seq")
         return isinstance(seq, int) and not isinstance(seq, bool) and seq > self.applied_seq + 1
 
+    def clear_pending(self, op_id: Optional[str]) -> None:
+        if isinstance(op_id, str):
+            self.pending_op_ids.discard(op_id)
+
     def track_pending(self, op_id: str) -> None:
         self.pending_op_ids.add(op_id)
 

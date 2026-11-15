@@ -141,11 +141,11 @@ Example:
 ### Client apply rules
 
 - Optimistic apply, reconciled by op_id: stroke_start, stroke_points, stroke_end,
-  shape, text, sticky, edit_object, move_object. The client renders locally
-  right away and ignores its own server echo by op_id.
-- Apply the server echo: delete_object, undo, redo, clear_canvas. The client
-  does not mutate the board on send; it waits for the broadcast so the sender
-  and every other client use the same code path.
+  shape, text, sticky. The client renders locally right away and ignores its
+  own server echo by op_id.
+- Apply the server echo: delete_object, undo, redo, clear_canvas, edit_object,
+  move_object. The client does not mutate the board on send; it waits for the
+  broadcast so the sender and every other client use the same code path.
 - cursor_move and chat are not part of the board state.
 
 - Undo is per user: it reverts the calling user's most recent active

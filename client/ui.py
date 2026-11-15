@@ -1586,9 +1586,8 @@ class WhiteboardApp:
         op_id = str(uuid.uuid4())
         self._last_delete = {"op_id": op_id, "target_id": sid}
         msg = {"type": "delete_object", "op_id": op_id, "target_id": sid}
-        self._pending_ops[op_id] = msg
-        self.state.track_pending(op_id)
-        self.net.send(msg)
+        if self.net:
+            self.net.send(msg)
         logging.getLogger("whiteboard.ui").debug("sent delete_object op=%s target=%s", op_id, sid)
         self._last_erased = sid
 
@@ -1601,8 +1600,6 @@ class WhiteboardApp:
                     msg = {"type": "move_object", "op_id": op_id,
                            "target_id": self._selected_sticky,
                            "x": obj.get("x"), "y": obj.get("y")}
-                    self.state.track_pending(op_id)
-                    self._pending_ops[op_id] = msg
                     if self.net:
                         self.net.send(msg)
             self._drag_origin = None
@@ -2392,8 +2389,6 @@ class WhiteboardApp:
             if item is not None:
                 self.canvas.delete(oid)
             self._add_sticky_item(obj)
-            self.state.track_pending(op_id)
-            self._pending_ops[op_id] = msg
             if self.net:
                 self.net.send(msg)
             return "break"
