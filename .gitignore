@@ -26,4 +26,6 @@ build/*
 !build/*.sh
 
 # Runtime data
-rooms/
+rooms/docs/viva-notes.md
+
+docs/viva-notes.md

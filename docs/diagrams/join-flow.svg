@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420">
+  <text x="450" y="35" text-anchor="middle" font-size="20" font-family="Arial">Join and create flow</text>
+  <rect x="60" y="70" width="220" height="50" fill="#dbeafe" stroke="#2563eb" />
+  <text x="170" y="100" text-anchor="middle" font-size="13" font-family="Arial">Connect screen</text>
+  <rect x="330" y="70" width="220" height="50" fill="#fef3c7" stroke="#ca8a04" />
+  <text x="440" y="100" text-anchor="middle" font-size="13" font-family="Arial">create_room or join_room</text>
+  <rect x="600" y="70" width="220" height="50" fill="#dcfce7" stroke="#16a34a" />
+  <text x="710" y="100" text-anchor="middle" font-size="13" font-family="Arial">join_ok / room_created</text>
+  <line x1="280" y1="95" x2="330" y2="95" stroke="#333" marker-end="url(#a)" />
+  <line x1="550" y1="95" x2="600" y2="95" stroke="#333" marker-end="url(#a)" />
+  <rect x="330" y="170" width="220" height="50" fill="#fee2e2" stroke="#dc2626" />
+  <text x="440" y="200" text-anchor="middle" font-size="13" font-family="Arial">join_denied</text>
+  <line x1="440" y1="120" x2="440" y2="170" stroke="#333" marker-end="url(#a)" />
+  <text x="455" y="150" font-size="11" font-family="Arial">bad code, password, lock, name</text>
+  <rect x="60" y="270" width="760" height="100" fill="#f3f4f6" stroke="#6b7280" />
+  <text x="80" y="295" font-size="13" font-family="Arial">On success: token, role, color, participants, snapshot or ops_since, chat history.</text>
+  <text x="80" y="320" font-size="13" font-family="Arial">Client builds the main window and starts polling the network queue.</text>
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#333" />
+    </marker>
+  </defs>
+</svg>

@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>InkLAN Technical Report</title>
+<style>
+@page { size: A4; margin: 20mm; @bottom-center { content: "Page " counter(page); } }
+body { font-family: "Segoe UI", Arial, sans-serif; font-size: 11pt; line-height: 1.45; color: #222; }
+h1, h2, h3 { color: #1f3864; page-break-after: avoid; }
+h1 { page-break-before: always; font-size: 20pt; }
+h2 { page-break-before: always; font-size: 15pt; margin-top: 1.2em; }
+table { border-collapse: collapse; width: 100%; margin: 0.8em 0; font-size: 9.5pt; }
+th, td { border: 1px solid #999; padding: 4px 6px; vertical-align: top; }
+th { background: #e8eef7; }
+thead { display: table-header-group; }
+tr { page-break-inside: avoid; }
+code, pre { font-family: Consolas, monospace; font-size: 9.5pt; }
+pre { background: #f3f3f3; padding: 8px; overflow-x: auto; }
+nav.toc { page-break-after: always; }
+nav.toc ul { list-style: none; padding-left: 0; }
+nav.toc li { margin: 0.25em 0; }
+nav.toc a { text-decoration: none; color: #1f3864; }
+svg { width: 100%; max-width: 100%; height: auto; margin: 0.8em 0; }
+.screenshot-placeholder { background: #e5e7eb; color: #555; padding: 24px; text-align: center; border: 1px dashed #999; margin: 0.8em 0; }
+@media print {
+  a { color: #000; text-decoration: none; }
+}
+</style>
+</head>
+<body>
+<nav class="toc"><h2>Contents</h2><ul>  <li><a href="#1-introduction-and-requirement-mapping">1. Introduction and requirement mapping</a></li>  <li><a href="#2-system-architecture">2. System architecture</a></li>  <li><a href="#socket-communication">Socket communication</a></li>  <li><a href="#3-application-protocol">3. Application protocol</a></li>  <li><a href="#4-synchronization-strategy">4. Synchronization strategy</a></li>  <li><a href="#5-concurrency-handling">5. Concurrency handling</a></li>  <li><a href="#thread-model">Thread model</a></li>  <li><a href="#6-ordering-duplicate-and-missing-update-handling">6. Ordering, duplicate and missing update handling</a></li>  <li><a href="#7-undo-and-redo-semantics-under-concurrency">7. Undo and redo semantics under concurrency</a></li>  <li><a href="#8-recovery-mechanisms">8. Recovery mechanisms</a></li>  <li><a href="#9-security-and-access-control">9. Security and access control</a></li>  <li><a href="#performance">Performance</a></li>  <li><a href="#10-testing">10. Testing</a></li>  <li><a href="#11-known-limitations-and-future-work">11. Known limitations and future work</a></li>  <li><a href="#12-user-guide">12. User guide</a></li>  <li><a href="#13-appendix">13. Appendix</a></li></ul></nav><h1 id="inklan-technical-report">InkLAN Technical Report</h1>
+<p>InkLAN: A LAN-based collaborative whiteboard.</p>
+<h2 id="1-introduction-and-requirement-mapping">1. Introduction and requirement mapping</h2>
+<table>
+<thead>
+<tr>
+<th>Requirement or rubric item</th>
+<th>Feature</th>
+<th>Module and function</th>
+<th>Test</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Drawing</td>
+<td>Pen, eraser, shapes, text, sticky notes</td>
+<td><code>client/ui.py</code> <code>_on_press</code>, <code>_on_motion</code>, <code>_on_release</code>; <code>client/tools.py</code>; <code>shapes_geometry.py</code></td>
+<td><code>tests/test_ui_smoke.py</code>, <code>tests/test_shape_drag.py</code>, <code>tests/test_sticky_ui.py</code></td>
+</tr>
+<tr>
+<td>Sync</td>
+<td>Server assigned seq, op log, snapshots</td>
+<td><code>server/room.py</code> <code>apply_op</code>, <code>snapshot</code>, <code>ops_since</code></td>
+<td><code>tests/test_canvas.py</code>, <code>tests/test_shapes.py</code></td>
+</tr>
+<tr>
+<td>Server coordination</td>
+<td>Room manager, locks, broadcast</td>
+<td><code>server/room_manager.py</code>, <code>server/room.py</code>, <code>server/client_handler.py</code></td>
+<td><code>tests/test_rooms.py</code>, <code>tests/test_reconnect.py</code></td>
+</tr>
+<tr>
+<td>Shared canvas</td>
+<td>Logical 1600x900 coordinates</td>
+<td><code>client/tools.py</code>, <code>client/ui.py</code> <code>_to_logical</code>, <code>_to_window</code></td>
+<td><code>tests/test_state.py</code>, <code>tests/test_ui_smoke.py</code></td>
+</tr>
+<tr>
+<td>Clear and persistence</td>
+<td>clear_canvas, save, load, autosave</td>
+<td><code>server/room.py</code> <code>clear_canvas</code>, <code>server/persistence.py</code></td>
+<td><code>tests/test_permissions_persistence.py</code>, <code>tests/test_autosave_cleanup.py</code></td>
+</tr>
+<tr>
+<td>Sessions</td>
+<td>create_room, join_room, reconnect, grace period</td>
+<td><code>server/client_handler.py</code> <code>_handle_create_room</code>, <code>_handle_join_room</code>, <code>_handle_reconnect</code>; <code>client/ui.py</code></td>
+<td><code>tests/test_reconnect.py</code>, <code>tests/test_reserved_name.py</code></td>
+</tr>
+<tr>
+<td>Participants</td>
+<td>Participant list, roles, host controls</td>
+<td><code>server/room.py</code> <code>participant_list</code>, <code>client/ui.py</code> <code>_rebuild_participants</code></td>
+<td><code>tests/test_ui_smoke.py</code></td>
+</tr>
+<tr>
+<td>Identification</td>
+<td>Username, color, role</td>
+<td><code>server/auth.py</code>, <code>server/room.py</code> <code>next_color</code></td>
+<td><code>tests/test_rooms.py</code></td>
+</tr>
+<tr>
+<td>Continuity</td>
+<td>Reconnect, reserved names, rejoin last room</td>
+<td><code>server/client_handler.py</code>, <code>client/session_store.py</code></td>
+<td><code>tests/test_reconnect.py</code>, <code>tests/test_reserved_name.py</code>, <code>tests/test_rejoin_ui.py</code></td>
+</tr>
+<tr>
+<td>Operation transmission</td>
+<td>Framed JSON over TCP</td>
+<td><code>protocol.py</code> <code>send_msg</code>, <code>recv_msg</code></td>
+<td><code>tests/test_framing.py</code></td>
+</tr>
+<tr>
+<td>Broadcasting</td>
+<td>Per room broadcast</td>
+<td><code>server/room.py</code> <code>broadcast</code></td>
+<td><code>tests/test_canvas.py</code></td>
+</tr>
+<tr>
+<td>Concurrent editing</td>
+<td>Per room lock and op log</td>
+<td><code>server/room.py</code> <code>apply_op</code></td>
+<td><code>tests/test_convergence.py</code></td>
+</tr>
+<tr>
+<td>Ordering and reliability</td>
+<td>seq, dedupe, gap detection, resync</td>
+<td><code>server/room.py</code>, <code>client/state.py</code> <code>apply_op</code></td>
+<td><code>tests/test_canvas.py</code>, <code>tests/test_reconnect.py</code></td>
+</tr>
+<tr>
+<td>Connection management</td>
+<td>Heartbeat, monitor thread, grace period</td>
+<td><code>server/client_handler.py</code> <code>monitor_clients</code></td>
+<td><code>tests/test_reconnect.py</code></td>
+</tr>
+<tr>
+<td>Chat</td>
+<td>Chat log and broadcast</td>
+<td><code>server/room.py</code> <code>apply_chat</code>, <code>client/ui.py</code> <code>_append_chat</code></td>
+<td><code>tests/test_canvas.py</code></td>
+</tr>
+<tr>
+<td>State representation</td>
+<td>Object map by id</td>
+<td><code>client/state.py</code> <code>BoardState.objects</code></td>
+<td><code>tests/test_state.py</code></td>
+</tr>
+<tr>
+<td>State sync</td>
+<td>snapshot, ops_since, resync_request</td>
+<td><code>server/room.py</code>, <code>client/state.py</code>, <code>client/ui.py</code></td>
+<td><code>tests/test_canvas.py</code>, <code>tests/test_reconnect.py</code></td>
+</tr>
+<tr>
+<td>Recovery</td>
+<td>Reconnect, autosave, save and load</td>
+<td><code>server/persistence.py</code>, <code>client/ui.py</code></td>
+<td><code>tests/test_autosave_cleanup.py</code>, <code>tests/test_reconnect.py</code></td>
+</tr>
+<tr>
+<td>Undo and redo</td>
+<td>Per user stacks, undo and redo ops</td>
+<td><code>server/room.py</code> <code>undo</code>, <code>redo</code>; <code>client/ui.py</code> <code>_undo</code>, <code>_redo</code></td>
+<td><code>tests/test_shapes.py</code>, <code>tests/test_sticky_notes.py</code></td>
+</tr>
+<tr>
+<td>Network architecture</td>
+<td>TCP server and threaded handlers</td>
+<td><code>server/main.py</code>, <code>server/client_handler.py</code></td>
+<td><code>tests/test_rooms.py</code>, <code>tests/test_reconnect.py</code></td>
+</tr>
+<tr>
+<td>Protocol design</td>
+<td>Length prefixed JSON, validators</td>
+<td><code>protocol.py</code>, <code>server/room.py</code> <code>validate_op</code></td>
+<td><code>tests/test_framing.py</code>, <code>tests/test_shapes.py</code></td>
+</tr>
+<tr>
+<td>UI</td>
+<td>tkinter canvas, toolbar, panels</td>
+<td><code>client/ui.py</code></td>
+<td><code>tests/test_ui_smoke.py</code>, <code>tests/test_toolbar_layout.py</code></td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>Batching, throttling, bounded queues</td>
+<td><code>client/ui.py</code>, <code>server/client_handler.py</code></td>
+<td><code>tests/test_backpressure.py</code></td>
+</tr>
+<tr>
+<td>Concurrency</td>
+<td>Locks, queues, monitor thread</td>
+<td><code>server/room.py</code>, <code>server/client_handler.py</code></td>
+<td><code>tests/test_convergence.py</code></td>
+</tr>
+<tr>
+<td>Security</td>
+<td>Passwords, roles, tokens, validation</td>
+<td><code>server/auth.py</code>, <code>server/room.py</code> <code>validate_op</code></td>
+<td><code>tests/test_permissions_persistence.py</code>, <code>tests/test_rooms.py</code></td>
+</tr>
+<tr>
+<td>Platform</td>
+<td>Windows and Linux scripts, platform_utils</td>
+<td><code>platform_utils.py</code>, <code>build/*.bat</code>, <code>build/*.sh</code></td>
+<td><code>tests/test_packaging.py</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="2-system-architecture">2. System architecture</h2>
+<p>InkLAN has one authoritative server and many thin clients. Clients render an optimistic local view and reconcile with server broadcasts.</p>
+<p><svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420">
+  <rect x="20" y="20" width="860" height="380" fill="#f7f7f7" stroke="#333" />
+  <text x="450" y="45" text-anchor="middle" font-size="20" font-family="Arial">Whiteboard architecture</text>
+  <rect x="60" y="90" width="180" height="70" fill="#dbeafe" stroke="#2563eb" />
+  <text x="150" y="130" text-anchor="middle" font-size="14" font-family="Arial">Client A (tkinter)</text>
+  <rect x="360" y="90" width="180" height="70" fill="#dbeafe" stroke="#2563eb" />
+  <text x="450" y="130" text-anchor="middle" font-size="14" font-family="Arial">Client B</text>
+  <rect x="660" y="90" width="180" height="70" fill="#dbeafe" stroke="#2563eb" />
+  <text x="750" y="130" text-anchor="middle" font-size="14" font-family="Arial">Client C</text>
+  <rect x="300" y="250" width="300" height="90" fill="#dcfce7" stroke="#16a34a" />
+  <text x="450" y="285" text-anchor="middle" font-size="16" font-family="Arial">InkLANServer</text>
+  <text x="450" y="310" text-anchor="middle" font-size="12" font-family="Arial">RoomManager, rooms, op log, locks</text>
+  <line x1="150" y1="160" x2="400" y2="250" stroke="#333" marker-end="url(#a)" />
+  <line x1="450" y1="160" x2="450" y2="250" stroke="#333" marker-end="url(#a)" />
+  <line x1="750" y1="160" x2="500" y2="250" stroke="#333" marker-end="url(#a)" />
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#333" />
+    </marker>
+  </defs>
+  <text x="450" y="385" text-anchor="middle" font-size="12" font-family="Arial">TCP length-prefixed JSON on port 5050</text>
+</svg></p>
+<p>Figure 1: Clients connect to the server over TCP. The server owns room state and broadcasts stamped ops.
+- <code>server/main.py</code>: argument parsing, socket bind, accept loop, monitor and autosave threads.
+- <code>server/client_handler.py</code>: per client thread, read loop, dispatch table, join, reconnect, rate limiting, backpressure.
+- <code>server/room.py</code>: room state, validation, op log, objects, chat, undo and redo.
+- <code>server/room_manager.py</code>: room registry and cleanup.
+- <code>server/auth.py</code>: salted password hashing and tokens.
+- <code>server/persistence.py</code>: JSON save, load, autosave, empty room cleanup.
+- <code>client</code> main entry point (start with <code>python -m client.main</code>)
+- <code>client/net.py</code>: socket, send queue, receive loop.
+- <code>client/state.py</code>: local board mirror and seq tracking.
+- <code>client/ui.py</code>: canvas, toolbar, panels, rendering, export.
+- <code>client/tools.py</code>: transforms, hit testing, shape constraints.
+- <code>shapes_geometry.py</code>: shared shape geometry.
+- <code>client/session_store.py</code>: saved reconnect tokens.</p>
+<p>Threads:
+- Server: one accept loop, one thread per client, one monitor thread, one autosave thread.
+- Client: UI thread plus network thread. The network thread never touches tkinter. It puts messages in <code>queue.Queue</code>; the UI polls with <code>root.after</code>.</p>
+<p>TCP was chosen because the project needs reliable, ordered delivery. Rebuilding ordering and retransmission on UDP would add work without benefit on a LAN. The protocol uses a 4 byte big endian length prefix followed by UTF-8 JSON.</p>
+<h3 id="socket-communication">Socket communication</h3>
+<p>The server binds to the requested host and port with <code>SO_REUSEADDR</code>. The accept loop waits for connections with a short timeout so shutdown stays responsive. Each accepted connection starts a daemon thread. The server pings clients every 5 seconds by default and marks a client disconnected after 15 seconds of silence. A read timeout or a half open connection is treated as a disconnect. On shutdown the server saves all rooms and joins the monitor and autosave threads with a short timeout.</p>
+<h2 id="3-application-protocol">3. Application protocol</h2>
+<p>Framing: every message is <code>[4 bytes big endian unsigned length N][N bytes UTF-8 JSON]</code>. <code>MAX_MESSAGE_SIZE</code> is 1 MB. <code>recv_exact</code> loops until enough bytes arrive. Partial reads and coalesced reads are handled by that loop. Oversize lengths are rejected before the body is read.</p>
+<p>The envelope is a JSON object with a <code>type</code> field. Server stamped ops also carry <code>seq</code>, <code>user</code>, and <code>ts</code>.</p>
+<p>Message types implemented in code:</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Direction</th>
+<th>Key fields</th>
+<th>Limits and notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>create_room</td>
+<td>client to server</td>
+<td>username, password?</td>
+<td>username validated</td>
+</tr>
+<tr>
+<td>room_created</td>
+<td>server to client</td>
+<td>room_code, token, role</td>
+<td>host role</td>
+</tr>
+<tr>
+<td>join_room</td>
+<td>client to server</td>
+<td>username, room_code, password?</td>
+<td>password checked</td>
+</tr>
+<tr>
+<td>join_ok</td>
+<td>server to client</td>
+<td>token, role, user_color, participants, snapshot, seq, chat_history</td>
+<td>full state</td>
+</tr>
+<tr>
+<td>join_denied</td>
+<td>server to client</td>
+<td>reason, message, remaining_grace?</td>
+<td>reserved name includes countdown</td>
+</tr>
+<tr>
+<td>reconnect</td>
+<td>client to server</td>
+<td>token, room_code, last_seq</td>
+<td>resumes session</td>
+</tr>
+<tr>
+<td>reconnect_ok</td>
+<td>server to client</td>
+<td>seq, snapshot or ops_since, participants</td>
+<td>state catch up</td>
+</tr>
+<tr>
+<td>reconnect_denied</td>
+<td>server to client</td>
+<td>reason, message</td>
+<td>invalid or expired token</td>
+</tr>
+<tr>
+<td>leave</td>
+<td>client to server</td>
+<td>none</td>
+<td>clean leave</td>
+</tr>
+<tr>
+<td>ping / pong</td>
+<td>both</td>
+<td>ts</td>
+<td>heartbeat</td>
+</tr>
+<tr>
+<td>error</td>
+<td>server to client</td>
+<td>code, message</td>
+<td>rejection</td>
+</tr>
+<tr>
+<td>user_joined, user_left, user_disconnected, user_reconnected, kicked</td>
+<td>server to client</td>
+<td>username, color, role</td>
+<td>presence</td>
+</tr>
+<tr>
+<td>participant_list</td>
+<td>server to client</td>
+<td>users</td>
+<td>name, color, role, online, reserved_for</td>
+</tr>
+<tr>
+<td>role_change</td>
+<td>client to server</td>
+<td>target, role</td>
+<td>host only</td>
+</tr>
+<tr>
+<td>kick</td>
+<td>client to server</td>
+<td>target</td>
+<td>host only</td>
+</tr>
+<tr>
+<td>remove_participant</td>
+<td>client to server</td>
+<td>target</td>
+<td>host only, offline slot</td>
+</tr>
+<tr>
+<td>lock_room</td>
+<td>client to server</td>
+<td>locked</td>
+<td>host only</td>
+</tr>
+<tr>
+<td>cursor_move</td>
+<td>client to server / broadcast</td>
+<td>x, y</td>
+<td>throttled, not logged</td>
+</tr>
+<tr>
+<td>stroke_start</td>
+<td>client to server / broadcast</td>
+<td>op_id, stroke_id, tool, color, width, x, y</td>
+<td>tool pen or eraser</td>
+</tr>
+<tr>
+<td>stroke_points</td>
+<td>client to server / broadcast</td>
+<td>op_id, stroke_id, points</td>
+<td>max 500 points</td>
+</tr>
+<tr>
+<td>stroke_end</td>
+<td>client to server / broadcast</td>
+<td>op_id, stroke_id</td>
+<td>ends stroke</td>
+</tr>
+<tr>
+<td>shape</td>
+<td>client to server / broadcast</td>
+<td>op_id, shape_id, kind, p1, p2, color, width, fill?</td>
+<td>kind in SHAPE_KINDS</td>
+</tr>
+<tr>
+<td>text</td>
+<td>client to server / broadcast</td>
+<td>op_id, obj_id, x, y, text, size, color</td>
+<td>text 1 to 500, size 8 to 72</td>
+</tr>
+<tr>
+<td>sticky</td>
+<td>client to server / broadcast</td>
+<td>op_id, obj_id, x, y, text, color</td>
+<td>text 1 to 300, 5 colors, fixed 220x160</td>
+</tr>
+<tr>
+<td>edit_object</td>
+<td>client to server / broadcast</td>
+<td>op_id, target_id, text</td>
+<td>text 1 to 300, sticky only</td>
+</tr>
+<tr>
+<td>move_object</td>
+<td>client to server / broadcast</td>
+<td>op_id, target_id, x, y</td>
+<td>sticky only</td>
+</tr>
+<tr>
+<td>delete_object</td>
+<td>client to server / broadcast</td>
+<td>op_id, target_id</td>
+<td>object eraser</td>
+</tr>
+<tr>
+<td>clear_canvas</td>
+<td>client to server / broadcast</td>
+<td>op_id</td>
+<td>host only</td>
+</tr>
+<tr>
+<td>undo / redo</td>
+<td>client to server / broadcast</td>
+<td>op_id</td>
+<td>per user</td>
+</tr>
+<tr>
+<td>snapshot</td>
+<td>server to client</td>
+<td>seq, objects, chat_tail</td>
+<td>full state</td>
+</tr>
+<tr>
+<td>ops_since</td>
+<td>server to client</td>
+<td>from_seq, ops</td>
+<td>incremental sync</td>
+</tr>
+<tr>
+<td>resync_request</td>
+<td>client to server</td>
+<td>last_seq</td>
+<td>gap recovery</td>
+</tr>
+<tr>
+<td>chat</td>
+<td>client to server / broadcast</td>
+<td>text</td>
+<td>max 500</td>
+</tr>
+<tr>
+<td>save_board</td>
+<td>client to server</td>
+<td>name</td>
+<td>host only</td>
+</tr>
+<tr>
+<td>load_board</td>
+<td>client to server</td>
+<td>name</td>
+<td>host only, broadcasts snapshot</td>
+</tr>
+<tr>
+<td>list_boards</td>
+<td>client to server</td>
+<td>none</td>
+<td>lists saved boards</td>
+</tr>
+<tr>
+<td>boards_list</td>
+<td>server to client</td>
+<td>boards</td>
+<td>saved board names</td>
+</tr>
+<tr>
+<td>board_hash_request</td>
+<td>client to server</td>
+<td>seq, hash</td>
+<td>consistency check</td>
+</tr>
+<tr>
+<td>board_hash</td>
+<td>server to client</td>
+<td>seq, hash</td>
+<td>consistency reply</td>
+</tr>
+</tbody>
+</table>
+<p>JSON examples:
+- Stroke: <code>{"type":"stroke_start","op_id":"...","stroke_id":"...","tool":"pen","color":"#123456","width":2,"x":10,"y":20}</code>
+- Shape: <code>{"type":"shape","op_id":"...","shape_id":"...","kind":"rectangle","p1":[1,2],"p2":[30,40],"color":"#123456","width":2,"fill":null}</code>
+- Text: <code>{"type":"text","op_id":"...","obj_id":"...","x":5,"y":6,"text":"hello","size":12,"color":"#222222"}</code>
+- Sticky: <code>{"type":"sticky","op_id":"...","obj_id":"...","x":10,"y":20,"text":"note","color":"#FFF2A8"}</code>
+- Chat: <code>{"type":"chat","text":"hello"}</code>
+- Join: <code>{"type":"join_room","username":"alice","room_code":"ABC123"}</code>
+- Reconnect: <code>{"type":"reconnect","token":"...","room_code":"ABC123","last_seq":42}</code>
+- Snapshot: <code>{"type":"snapshot","seq":42,"objects":[...],"chat_tail":[...]}</code>
+- Resync: <code>{"type":"resync_request","last_seq":40}</code></p>
+<p>The eraser is an object eraser: it sends <code>delete_object</code>, not a stroke with tool eraser. <code>stroke_start</code> still allows tool values <code>pen</code> and <code>eraser</code> as defined in <code>TOOLS</code>, but the client eraser uses <code>delete_object</code>.</p>
+<p><svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420">
+  <text x="450" y="35" text-anchor="middle" font-size="20" font-family="Arial">Join and create flow</text>
+  <rect x="60" y="70" width="220" height="50" fill="#dbeafe" stroke="#2563eb" />
+  <text x="170" y="100" text-anchor="middle" font-size="13" font-family="Arial">Connect screen</text>
+  <rect x="330" y="70" width="220" height="50" fill="#fef3c7" stroke="#ca8a04" />
+  <text x="440" y="100" text-anchor="middle" font-size="13" font-family="Arial">create_room or join_room</text>
+  <rect x="600" y="70" width="220" height="50" fill="#dcfce7" stroke="#16a34a" />
+  <text x="710" y="100" text-anchor="middle" font-size="13" font-family="Arial">join_ok / room_created</text>
+  <line x1="280" y1="95" x2="330" y2="95" stroke="#333" marker-end="url(#a)" />
+  <line x1="550" y1="95" x2="600" y2="95" stroke="#333" marker-end="url(#a)" />
+  <rect x="330" y="170" width="220" height="50" fill="#fee2e2" stroke="#dc2626" />
+  <text x="440" y="200" text-anchor="middle" font-size="13" font-family="Arial">join_denied</text>
+  <line x1="440" y1="120" x2="440" y2="170" stroke="#333" marker-end="url(#a)" />
+  <text x="455" y="150" font-size="11" font-family="Arial">bad code, password, lock, name</text>
+  <rect x="60" y="270" width="760" height="100" fill="#f3f4f6" stroke="#6b7280" />
+  <text x="80" y="295" font-size="13" font-family="Arial">On success: token, role, color, participants, snapshot or ops_since, chat history.</text>
+  <text x="80" y="320" font-size="13" font-family="Arial">Client builds the main window and starts polling the network queue.</text>
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#333" />
+    </marker>
+  </defs>
+</svg></p>
+<p>Figure 2: Create or join a room, then receive join_ok or join_denied.</p>
+<h2 id="4-synchronization-strategy">4. Synchronization strategy</h2>
+<p>The server keeps an append-only op log. Each accepted op gets the next room seq. Clients apply ops in seq order. Clients render additive ops locally right away and reconcile by op_id. Delete, undo, redo, clear, edit and move are not applied locally as separate mutations; the sender waits for the server broadcast and applies it like every other client.</p>
+<p>Snapshots contain seq, objects and chat_tail. Late joiners receive a snapshot. Reconnecting clients receive ops_since when the gap is small, otherwise a snapshot.</p>
+<p>The client tracks applied_seq and latest_seq. If an op arrives ahead of the next expected seq, it buffers the op and sends resync_request. The client also computes a board hash and compares it with the server hash. If the seq matches but the hash differs, it logs a warning, shows "out of sync" and requests a snapshot.</p>
+<p><svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420">
+  <text x="450" y="35" text-anchor="middle" font-size="20" font-family="Arial">Stroke sequence</text>
+  <rect x="80" y="70" width="200" height="50" fill="#dbeafe" stroke="#2563eb" />
+  <text x="180" y="100" text-anchor="middle" font-size="13" font-family="Arial">Client renders locally</text>
+  <rect x="350" y="70" width="200" height="50" fill="#fef3c7" stroke="#ca8a04" />
+  <text x="450" y="100" text-anchor="middle" font-size="13" font-family="Arial">stroke_start</text>
+  <rect x="620" y="70" width="200" height="50" fill="#fef3c7" stroke="#ca8a04" />
+  <text x="720" y="100" text-anchor="middle" font-size="13" font-family="Arial">stroke_points batches</text>
+  <line x1="280" y1="95" x2="350" y2="95" stroke="#333" marker-end="url(#a)" />
+  <line x1="550" y1="95" x2="620" y2="95" stroke="#333" marker-end="url(#a)" />
+  <rect x="350" y="170" width="200" height="50" fill="#fef3c7" stroke="#ca8a04" />
+  <text x="450" y="200" text-anchor="middle" font-size="13" font-family="Arial">stroke_end</text>
+  <rect x="620" y="170" width="200" height="50" fill="#dcfce7" stroke="#16a34a" />
+  <text x="720" y="200" text-anchor="middle" font-size="13" font-family="Arial">Server stamps seq and broadcasts</text>
+  <line x1="450" y1="120" x2="450" y2="170" stroke="#333" marker-end="url(#a)" />
+  <line x1="550" y1="195" x2="620" y2="195" stroke="#333" marker-end="url(#a)" />
+  <rect x="80" y="270" width="740" height="90" fill="#f3f4f6" stroke="#6b7280" />
+  <text x="100" y="300" font-size="13" font-family="Arial">Other clients render by stroke_id. The sender matches the echo by op_id and does not draw twice.</text>
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#333" />
+    </marker>
+  </defs>
+</svg></p>
+<p>Figure 3: A stroke is rendered locally, sent in batches, stamped by the server, and broadcast to other clients.</p>
+<p>Worked example with real seq values:</p>
+<ul>
+<li>Start: both clients have applied seq 4.</li>
+<li>User A sends a stroke. The server stamps it seq 5 and broadcasts it. Both clients apply seq 5. Both show stroke A.</li>
+<li>User B sends a stroke. The server stamps it seq 6. Both clients apply seq 6. Both show stroke A and stroke B.</li>
+<li>User A erases B's stroke. The server stamps <code>delete_object</code> seq 7. Both clients remove B's stroke.</li>
+<li>User A undoes her own stroke. The server stamps undo seq 8 with action <code>remove_stroke</code>. Both clients remove A's stroke.</li>
+<li>After these four steps both boards are empty and both have applied seq 8.</li>
+</ul>
+<p>Optimistic apply is used for additive ops so the local user sees no delay. Delete, undo, redo, clear, edit and move are applied from the server broadcast so the sender and all other clients use the same path and converge.</p>
+<p><svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420">
+  <text x="450" y="35" text-anchor="middle" font-size="20" font-family="Arial">Concurrent edit example</text>
+  <rect x="80" y="70" width="220" height="50" fill="#dbeafe" stroke="#2563eb" />
+  <text x="190" y="100" text-anchor="middle" font-size="13" font-family="Arial">Client A sends edit</text>
+  <rect x="600" y="70" width="220" height="50" fill="#dbeafe" stroke="#2563eb" />
+  <text x="710" y="100" text-anchor="middle" font-size="13" font-family="Arial">Client B sends move</text>
+  <rect x="340" y="170" width="220" height="50" fill="#dcfce7" stroke="#16a34a" />
+  <text x="450" y="200" text-anchor="middle" font-size="13" font-family="Arial">Server locks room</text>
+  <rect x="340" y="270" width="220" height="50" fill="#dcfce7" stroke="#16a34a" />
+  <text x="450" y="300" text-anchor="middle" font-size="13" font-family="Arial">Seq 10 edit, Seq 11 move</text>
+  <line x1="190" y1="120" x2="400" y2="170" stroke="#333" marker-end="url(#a)" />
+  <line x1="710" y1="120" x2="500" y2="170" stroke="#333" marker-end="url(#a)" />
+  <line x1="450" y1="220" x2="450" y2="270" stroke="#333" marker-end="url(#a)" />
+  <text x="80" y="360" font-size="13" font-family="Arial">Both clients apply the two ops in seq order, so both boards match.</text>
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#333" />
+    </marker>
+  </defs>
+</svg></p>
+<p>Figure 4: Two clients edit at the same time. The server assigns seq 10 and 11; both clients apply them in that order.</p>
+<h2 id="5-concurrency-handling">5. Concurrency handling</h2>
+<ul>
+<li>Each room has a <code>threading.Lock</code>.</li>
+<li><code>apply_op</code> validates, dedupes by op_id, increments seq, appends to the log, and updates objects inside that lock.</li>
+<li>Each client has a send queue and writer thread. Broadcasts do not block the room on a slow client.</li>
+<li>A single monitor thread scans all clients for heartbeat timeouts.</li>
+<li>Backpressure: if a client's send queue overflows, it is put in resync mode and later resyncs.</li>
+<li>Rate limiting: ops are limited per client per second.</li>
+<li>Client rule: only the UI thread touches tkinter. The network thread pushes messages into <code>queue.Queue</code>; the UI polls with <code>root.after</code>.</li>
+</ul>
+<h3 id="thread-model">Thread model</h3>
+<p><svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420">
+  <text x="450" y="35" text-anchor="middle" font-size="20" font-family="Arial">Thread model</text>
+  <rect x="80" y="70" width="260" height="120" fill="#dbeafe" stroke="#2563eb" />
+  <text x="210" y="100" text-anchor="middle" font-size="14" font-family="Arial">Client UI thread</text>
+  <text x="210" y="125" text-anchor="middle" font-size="12" font-family="Arial">tkinter, canvas, toolbar</text>
+  <text x="210" y="145" text-anchor="middle" font-size="12" font-family="Arial">polls queue.Queue</text>
+  <rect x="560" y="70" width="260" height="120" fill="#dcfce7" stroke="#16a34a" />
+  <text x="690" y="100" text-anchor="middle" font-size="14" font-family="Arial">Server room lock</text>
+  <text x="690" y="125" text-anchor="middle" font-size="12" font-family="Arial">one thread per client</text>
+  <text x="690" y="145" text-anchor="middle" font-size="12" font-family="Arial">monitor and autosave threads</text>
+  <rect x="320" y="260" width="260" height="80" fill="#fef3c7" stroke="#ca8a04" />
+  <text x="450" y="290" text-anchor="middle" font-size="14" font-family="Arial">Shared queue</text>
+  <text x="450" y="315" text-anchor="middle" font-size="12" font-family="Arial">messages in, never tkinter from workers</text>
+  <line x1="210" y1="190" x2="400" y2="260" stroke="#333" marker-end="url(#a)" />
+  <line x1="690" y1="190" x2="500" y2="260" stroke="#333" marker-end="url(#a)" />
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#333" />
+    </marker>
+  </defs>
+</svg></p>
+<p>Figure 5: UI thread and network thread on the client; room lock, client threads, monitor thread and autosave thread on the server.</p>
+<h2 id="6-ordering-duplicate-and-missing-update-handling">6. Ordering, duplicate and missing update handling</h2>
+<ul>
+<li>Only the server assigns seq.</li>
+<li>op_id (UUID) is used for deduplication on both sides.</li>
+<li>The client detects gaps when seq is greater than applied_seq + 1.</li>
+<li>On a gap, the client buffers the op and sends resync_request(last_applied_seq).</li>
+<li>The server replies with ops_since or a snapshot.</li>
+<li>Delayed ops are applied at their stamped position.</li>
+<li>Duplicate ops are ignored.</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>Failure case</th>
+<th>Client action</th>
+<th>Server action</th>
+<th>Test</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Duplicate op</td>
+<td>ignore by seq</td>
+<td>ignore by op_id</td>
+<td><code>tests/test_shapes.py</code></td>
+</tr>
+<tr>
+<td>Op out of order</td>
+<td>buffer and resync</td>
+<td>ops_since or snapshot</td>
+<td><code>tests/test_reconnect.py</code></td>
+</tr>
+<tr>
+<td>Missing op</td>
+<td>gap detection</td>
+<td>ops_since or snapshot</td>
+<td><code>tests/test_reconnect.py</code></td>
+</tr>
+<tr>
+<td>Delayed op</td>
+<td>applied at stamped seq</td>
+<td>seq stamping</td>
+<td><code>tests/test_canvas.py</code></td>
+</tr>
+<tr>
+<td>Lost reconnect</td>
+<td>reconnect with token and last_seq</td>
+<td>reconnect_ok</td>
+<td><code>tests/test_reconnect.py</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="7-undo-and-redo-semantics-under-concurrency">7. Undo and redo semantics under concurrency</h2>
+<p>Rules:
+- Undo is per user.
+- A stroke is one undoable unit.
+- Undo is logged as a new op, so all clients stay in sync.
+- Redo re-applies the last undone op.
+- A new drawing action clears the redo stack.
+- If another user deleted the target, undo is a no-op with a notice.
+- clear_canvas can be undone by the host.</p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Undo own stroke</td>
+<td>stroke removed on all clients</td>
+</tr>
+<tr>
+<td>Undo deleted object</td>
+<td>no-op, notice shown</td>
+</tr>
+<tr>
+<td>Undo clear</td>
+<td>cleared objects restored</td>
+</tr>
+<tr>
+<td>Redo after new action</td>
+<td>redo stack cleared</td>
+</tr>
+<tr>
+<td>Undo another user's object</td>
+<td>not allowed; undo is per user</td>
+</tr>
+</tbody>
+</table>
+<h2 id="8-recovery-mechanisms">8. Recovery mechanisms</h2>
+<ul>
+<li>Heartbeat: server pings every 5 seconds by default; 15 seconds of silence marks a client disconnected.</li>
+<li>Disconnected users stay offline for a configurable grace period (default 120 seconds).</li>
+<li>Tokens are issued on join and used for reconnect.</li>
+<li>reconnect validates the token and restores username, color, role and undo stacks.</li>
+<li>A second connection with the same token replaces the first socket.</li>
+<li>Reserved names: a name belonging to an offline user is reserved for the grace period. The join denial includes remaining seconds.</li>
+<li>The host can remove an offline slot immediately. This does not block a later reconnect with a valid token.</li>
+<li>The client saves the last session token in the user config folder and offers Rejoin last room.</li>
+<li>Autosave runs on an interval and saves dirty rooms.</li>
+<li>Save and load write and read JSON board files.</li>
+<li>Empty rooms are saved and removed after a grace period.</li>
+<li>If the host leaves, the room remains until the empty-room grace expires.</li>
+</ul>
+<p><svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420">
+  <text x="450" y="35" text-anchor="middle" font-size="20" font-family="Arial">Reconnection flow</text>
+  <rect x="80" y="70" width="220" height="50" fill="#fee2e2" stroke="#dc2626" />
+  <text x="190" y="100" text-anchor="middle" font-size="13" font-family="Arial">Socket lost</text>
+  <rect x="350" y="70" width="220" height="50" fill="#fef3c7" stroke="#ca8a04" />
+  <text x="460" y="100" text-anchor="middle" font-size="13" font-family="Arial">Backoff and reconnect</text>
+  <rect x="620" y="70" width="200" height="50" fill="#dcfce7" stroke="#16a34a" />
+  <text x="720" y="100" text-anchor="middle" font-size="13" font-family="Arial">reconnect_ok</text>
+  <line x1="300" y1="95" x2="350" y2="95" stroke="#333" marker-end="url(#a)" />
+  <line x1="570" y1="95" x2="620" y2="95" stroke="#333" marker-end="url(#a)" />
+  <rect x="80" y="170" width="220" height="50" fill="#f3f4f6" stroke="#6b7280" />
+  <text x="190" y="200" text-anchor="middle" font-size="13" font-family="Arial">token and last_seq</text>
+  <rect x="350" y="170" width="220" height="50" fill="#f3f4f6" stroke="#6b7280" />
+  <text x="460" y="200" text-anchor="middle" font-size="13" font-family="Arial">ops_since or snapshot</text>
+  <rect x="620" y="170" width="200" height="50" fill="#f3f4f6" stroke="#6b7280" />
+  <text x="720" y="200" text-anchor="middle" font-size="13" font-family="Arial">resume polling</text>
+  <line x1="190" y1="120" x2="190" y2="170" stroke="#333" marker-end="url(#a)" />
+  <line x1="300" y1="195" x2="350" y2="195" stroke="#333" marker-end="url(#a)" />
+  <line x1="570" y1="195" x2="620" y2="195" stroke="#333" marker-end="url(#a)" />
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#333" />
+    </marker>
+  </defs>
+</svg></p>
+<p>Figure 6: Socket loss, backoff, reconnect with token and last_seq, then state catch-up.</p>
+<h2 id="9-security-and-access-control">9. Security and access control</h2>
+<ul>
+<li>Room code plus optional password.</li>
+<li>Passwords use PBKDF2 with a salt.</li>
+<li>Session tokens use <code>secrets.token_hex</code>.</li>
+<li>Roles: host, editor, viewer.</li>
+<li>Viewers cannot draw or delete.</li>
+<li>Only the host can clear, save, load, kick, change roles, lock the room, and remove offline slots.</li>
+<li>Login attempts are rate limited.</li>
+<li>All validation is server side.</li>
+</ul>
+<p>Traffic is not encrypted. This is a LAN scope decision and is stated plainly.</p>
+<h2 id="performance">Performance</h2>
+<h2 id="10-testing">10. Testing</h2>
+<p>Date of this report: 15 Nov 2026.</p>
+<p>Counts from the current suite:
+- Default run: <code>194 passed, 13 skipped in 169.75s (0:02:49)</code>
+- Full run: <code>207 passed in 195.67s (0:03:15)</code></p>
+<p>Test files and coverage:
+- <code>tests/test_framing.py</code>: framing.
+- <code>tests/test_rooms.py</code>: rooms and participants.
+- <code>tests/test_canvas.py</code>: drawing, sync, resync.
+- <code>tests/test_state.py</code>: client state and coordinates.
+- <code>tests/test_tools.py</code>: tool helpers.
+- <code>tests/test_ui_smoke.py</code>: headless UI.
+- <code>tests/test_ui_connect.py</code>: connect mode.
+- <code>tests/test_reconnect.py</code>: reconnect, grace, monitor.
+- <code>tests/test_autosave_cleanup.py</code>: autosave and cleanup.
+- <code>tests/test_backpressure.py</code>: queue overflow.
+- <code>tests/test_shapes.py</code>: shapes and text.
+- <code>tests/test_shape_drag.py</code>: shape drag and preview.
+- <code>tests/test_item_cleanup.py</code>: canvas item cleanup.
+- <code>tests/test_sticky_notes.py</code>: sticky validation and sync.
+- <code>tests/test_sticky_ui.py</code>: sticky UI.
+- <code>tests/test_png_export.py</code>: PNG export.
+- <code>tests/test_erase_both.py</code>: erase convergence and board hash.
+- <code>tests/test_erase_real_events.py</code>: real eraser events.
+- <code>tests/test_convergence.py</code>: scripted and random convergence.
+- <code>tests/test_connect_e2e.py</code>: real connect flow.
+- <code>tests/test_connect_guard.py</code>: connection threads.
+- <code>tests/test_network_client_attrs.py</code>: network client attributes.
+- <code>tests/test_reserved_name.py</code>: reserved names.
+- <code>tests/test_rejoin_ui.py</code>: rejoin UI.
+- <code>tests/test_session_store.py</code>: token store.
+- <code>tests/test_toolbar_layout.py</code>: toolbar layout.
+- <code>tests/test_keyboard_shortcuts.py</code>: keyboard shortcuts.
+- <code>tests/test_error_reporting.py</code>: error deduplication.
+- <code>tests/test_permissions_persistence.py</code>: permissions and persistence.
+- <code>tests/test_packaging.py</code>: packaging static checks.
+- <code>tests/test_static_checks.py</code>: static checks.</p>
+<p>Manual checks:
+- Windows executable build and run were checked.
+- Linux binaries and GUI were not tested on Linux.
+- Two physical machines were not tested in this environment.</p>
+<h2 id="11-known-limitations-and-future-work">11. Known limitations and future work</h2>
+<ul>
+<li>History and presentation mode are not implemented.</li>
+<li>Linux binaries and the GUI on Linux are untested.</li>
+<li>Traffic is not encrypted.</li>
+<li>The suite takes about 3 minutes for the full run.</li>
+<li>Text uses one font family and clips long text.</li>
+<li>Undo of a deleted target is a no-op with a notice.</li>
+</ul>
+<h2 id="12-user-guide">12. User guide</h2>
+<ol>
+<li>System requirements: Python 3.11+ for source, or the packaged Windows executables.</li>
+<li>Packaged release: run <code>allow_firewall.bat</code> as administrator, then <code>run_server.bat</code>, then <code>run_client.bat</code> on each machine.</li>
+<li>From source on Windows: create a venv, install requirements, run <code>python server/main.py</code> and <code>python -m client.main</code>.</li>
+<li>From source on Linux: install <code>python3-tk</code>, create a venv, install requirements, run the same commands.</li>
+<li>Find the server LAN IP with <code>ipconfig</code> on Windows or <code>ip addr</code> on Linux.</li>
+<li>Open port 5050 in the firewall. Windows: <code>netsh advfirewall firewall add rule name="InkLAN" dir=in action=allow protocol=TCP localport=5050</code>. Linux: <code>sudo ufw allow 5050/tcp</code>.</li>
+<li>Start the server. Options include <code>--host</code>, <code>--port</code>, <code>--rooms-dir</code>, <code>--grace-period</code>, <code>--autosave-interval</code>, and <code>--rate-limit</code>.</li>
+<li>Create a room in the client. Share the room code and optional password.</li>
+<li>Join with server IP, port, username and room code.</li>
+<li>Use pen, eraser, text, select, sticky, shapes, color, width, fill, text size, undo, redo, clear, save, load and export.</li>
+<li>The participant list shows names, colors, roles and online state. Hosts can apply roles, kick, remove offline slots and lock the room.</li>
+<li>Chat is in the right panel.</li>
+<li>After a disconnect, the client retries with backoff. Use Rejoin last room to restore the session.</li>
+<li>Reserved names: if your name is reserved, wait or ask the host to remove your slot.</li>
+<li>Troubleshooting: connection refused means the server is not running or the firewall blocks it; timed out means the wrong IP or port; wrong room code or password means check the shared code; name reserved means wait or rejoin; SmartScreen or antivirus may require allowing the executable.</li>
+</ol>
+<h2 id="13-appendix">13. Appendix</h2>
+<p>Screenshot placeholders:
+1. <code>01-connect.png<br><div class="screenshot-placeholder">Screenshot not provided: 01-connect.png<br>Connect screen.</div></code> - Connect screen.
+2. <code>02-main-window.png<br><div class="screenshot-placeholder">Screenshot not provided: 02-main-window.png<br>Main window with toolbar.</div></code> - Main window with toolbar.
+3. <code>03-shapes-palette.png<br><div class="screenshot-placeholder">Screenshot not provided: 03-shapes-palette.png<br>Shapes palette.</div></code> - Shapes palette.
+4. <code>04-board-stickies-text.png<br><div class="screenshot-placeholder">Screenshot not provided: 04-board-stickies-text.png<br>Board with stickies and text.</div></code> - Board with stickies and text.
+5. <code>05-participants-chat.png<br><div class="screenshot-placeholder">Screenshot not provided: 05-participants-chat.png<br>Participant list and chat.</div></code> - Participant list and chat.
+6. <code>06-host-controls.png<br><div class="screenshot-placeholder">Screenshot not provided: 06-host-controls.png<br>Host controls.</div></code> - Host controls.
+7. <code>07-export.png<br><div class="screenshot-placeholder">Screenshot not provided: 07-export.png<br>Export dialog.</div></code> - Export dialog.
+8. <code>08-dark-theme.png<br><div class="screenshot-placeholder">Screenshot not provided: 08-dark-theme.png<br>Dark theme.</div></code> - Dark theme.
+9. <code>09-rejoin.png<br><div class="screenshot-placeholder">Screenshot not provided: 09-rejoin.png<br>Rejoin button.</div></code> - Rejoin button.
+10. <code>10-reserved-name.png<br><div class="screenshot-placeholder">Screenshot not provided: 10-reserved-name.png<br>Reserved name message.</div></code> - Reserved name message.</p>
+<p>Repository layout:
+- <code>protocol.py</code>
+- <code>server/</code>
+- <code>client/</code>
+- <code>tests/</code>
+- <code>docs/</code>
+- <code>build/</code>
+- <code>shapes_geometry.py</code></p>
+<p>Rebuild: see <code>docs/build.md</code>.</p>
+<p>SVG diagrams are in <code>docs/diagrams/</code>: <code>architecture.svg</code>, <code>join-flow.svg</code>, <code>stroke-sequence.svg</code>, <code>reconnection-flow.svg</code>, <code>concurrent-edit.svg</code>, <code>thread-model.svg</code>. They are embedded in the HTML version.</p>
+</body>
+</html>

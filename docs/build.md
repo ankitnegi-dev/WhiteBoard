@@ -10,6 +10,14 @@
    `build\build_all.bat`
 4. Results are in `dist\` and the clean release bundle is in `release\`.
 
+The release bundle contains:
+- `InkLANServer.exe`
+- `InkLANClient.exe`
+- `run_server.bat`
+- `run_client.bat`
+- `allow_firewall.bat`
+- `README.txt`
+
 Server only:
 `build\build_server.bat`
 

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420">
+  <text x="450" y="35" text-anchor="middle" font-size="20" font-family="Arial">Thread model</text>
+  <rect x="80" y="70" width="260" height="120" fill="#dbeafe" stroke="#2563eb" />
+  <text x="210" y="100" text-anchor="middle" font-size="14" font-family="Arial">Client UI thread</text>
+  <text x="210" y="125" text-anchor="middle" font-size="12" font-family="Arial">tkinter, canvas, toolbar</text>
+  <text x="210" y="145" text-anchor="middle" font-size="12" font-family="Arial">polls queue.Queue</text>
+  <rect x="560" y="70" width="260" height="120" fill="#dcfce7" stroke="#16a34a" />
+  <text x="690" y="100" text-anchor="middle" font-size="14" font-family="Arial">Server room lock</text>
+  <text x="690" y="125" text-anchor="middle" font-size="12" font-family="Arial">one thread per client</text>
+  <text x="690" y="145" text-anchor="middle" font-size="12" font-family="Arial">monitor and autosave threads</text>
+  <rect x="320" y="260" width="260" height="80" fill="#fef3c7" stroke="#ca8a04" />
+  <text x="450" y="290" text-anchor="middle" font-size="14" font-family="Arial">Shared queue</text>
+  <text x="450" y="315" text-anchor="middle" font-size="12" font-family="Arial">messages in, never tkinter from workers</text>
+  <line x1="210" y1="190" x2="400" y2="260" stroke="#333" marker-end="url(#a)" />
+  <line x1="690" y1="190" x2="500" y2="260" stroke="#333" marker-end="url(#a)" />
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#333" />
+    </marker>
+  </defs>
+</svg>
