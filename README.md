@@ -1,4 +1,4 @@
-# LAN Collaborative Whiteboard
+# InkLAN
 
 Server-based, multi-user whiteboard over a LAN using TCP sockets. The server
 is authoritative and holds the operation log; clients are thin views.

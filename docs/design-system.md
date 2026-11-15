@@ -1,4 +1,4 @@
-# Design System: LAN Collaborative Whiteboard
+# Design System: InkLAN
 
 Applies the frontend-design skill to a tkinter + ttk desktop client. The
 subject is a collaborative whiteboard: chalk, paper, ink, grid, and the

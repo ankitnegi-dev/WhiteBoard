@@ -7,6 +7,6 @@ if not exist .venv\Scripts\pyinstaller.exe (
     exit /b 1
 )
 if not exist .pyi_work mkdir .pyi_work
-.venv\Scripts\pyinstaller.exe --clean --noconfirm --onefile --name WhiteboardServer --workpath .pyi_work --distpath dist --specpath .pyi_work --hidden-import protocol --hidden-import platform_utils --hidden-import server.client_handler --hidden-import server.room_manager --hidden-import server.persistence server\main.py
+.venv\Scripts\pyinstaller.exe --clean --noconfirm --onefile --name InkLANServer --workpath .pyi_work --distpath dist --specpath .pyi_work --hidden-import protocol --hidden-import platform_utils --hidden-import server.client_handler --hidden-import server.room_manager --hidden-import server.persistence server\main.py
 if errorlevel 1 exit /b 1
 endlocal

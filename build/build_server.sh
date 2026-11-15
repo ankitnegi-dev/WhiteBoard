@@ -7,4 +7,4 @@ if [ ! -x .venv/bin/pyinstaller ]; then
     exit 1
 fi
 mkdir -p .pyi_work
-.venv/bin/pyinstaller --clean --noconfirm --onefile --name WhiteboardServer --workpath .pyi_work --distpath dist --specpath .pyi_work --hidden-import protocol --hidden-import platform_utils --hidden-import server.client_handler --hidden-import server.room_manager --hidden-import server.persistence server/main.py
+.venv/bin/pyinstaller --clean --noconfirm --onefile --name InkLANServer --workpath .pyi_work --distpath dist --specpath .pyi_work --hidden-import protocol --hidden-import platform_utils --hidden-import server.client_handler --hidden-import server.room_manager --hidden-import server.persistence server/main.py

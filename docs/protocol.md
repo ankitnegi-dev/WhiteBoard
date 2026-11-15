@@ -1,4 +1,4 @@
-# LAN Collaborative Whiteboard Protocol
+# InkLAN Protocol
 
 Source of truth for the wire format. Derived from docs/ROADMAP.md sections
 4 and 5. If a change is needed, update this document first, then code.

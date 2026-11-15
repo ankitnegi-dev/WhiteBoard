@@ -8,18 +8,18 @@ call build\build_client.bat
 if errorlevel 1 exit /b 1
 if exist release rmdir /s /q release
 mkdir release
-copy /Y dist\WhiteboardServer.exe release\ >nul
-copy /Y dist\WhiteboardClient.exe release\ >nul
+copy /Y dist\InkLANServer.exe release\ >nul
+copy /Y dist\InkLANClient.exe release\ >nul
 (
 echo @echo off
 echo cd /d "%%~dp0"
-echo WhiteboardServer.exe %%*
+echo InkLANServer.exe %%*
 echo pause
 ) > release\run_server.bat
 (
 echo @echo off
 echo cd /d "%%~dp0"
-echo start "" "WhiteboardClient.exe"
+echo start "" "InkLANClient.exe"
 ) > release\run_client.bat
 (
 echo @echo off
@@ -28,10 +28,10 @@ echo echo Done. Run this script as Administrator.
 echo pause
 ) > release\allow_firewall.bat
 (
-echo Whiteboard LAN quick start
+echo InkLAN quick start
 echo 1. Run allow_firewall.bat as Administrator once.
-echo 2. Start WhiteboardServer.exe and note the LAN IP.
-echo 3. Start WhiteboardClient.exe on each machine.
+echo 2. Start InkLANServer.exe and note the LAN IP.
+echo 3. Start InkLANClient.exe on each machine.
 echo 4. Create a room in one client.
 echo 5. Join with the room code from the other clients.
 echo 6. Draw, chat, undo, and export PNG.
@@ -39,7 +39,7 @@ echo 7. Save and load boards from the toolbar.
 echo 8. If the exe is blocked, run from source with Python 3.11+.
 echo 9. Keep the server and clients on the same LAN.
 echo 10. Internet is not required.
-echo 11. Rooms are saved next to WhiteboardServer.exe.
+echo 11. Rooms are saved next to InkLANServer.exe.
 echo 12. Client errors are written to whiteboard-client.log.
 echo 13. Rebuild with build\build_all.bat.
 echo 14. Linux needs its own build.

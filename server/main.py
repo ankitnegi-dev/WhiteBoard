@@ -22,6 +22,11 @@ import sys as _sys
 
 _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+try:
+    from client.app_info import APP_NAME
+except Exception:  # pragma: no cover
+    APP_NAME = "InkLAN"
+
 import platform_utils
 from server.client_handler import handle_client, monitor_clients
 from server.room_manager import RoomManager
@@ -94,7 +99,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     log.info("server listening on %s:%d", args.host, args.port)
     for ip in platform_utils.get_lan_ips():
         log.info("LAN client target: %s:%d", ip, args.port)
-    print(f"Whiteboard server listening on {args.host}:{args.port}")
+    print(f"{APP_NAME} server listening on {args.host}:{args.port}")
     for ip in platform_utils.get_lan_ips():
         print(f"  connect clients to {ip}:{args.port}")
 

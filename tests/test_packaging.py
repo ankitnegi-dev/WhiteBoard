@@ -13,10 +13,12 @@ def test_build_scripts_include_required_modules():
     for name in ("protocol", "platform_utils", "server.client_handler",
                  "server.room_manager", "server.persistence"):
         assert name in server
+    assert "InkLANServer" in server
     for name in ("protocol", "shapes_geometry", "platform_utils", "client.ui",
                  "client.state", "client.tools", "client.net"):
         assert name in client
     assert "--collect-all tkinter" in client
+    assert "InkLANClient" in client
 
 
 def test_gitignore_excludes_build_outputs():

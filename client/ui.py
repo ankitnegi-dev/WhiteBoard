@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover - handled in main.py
 
 from client.net import NetworkClient
 from client.state import BoardState
+from client.app_info import APP_NAME, APP_SUBTITLE
 from client.tools import (
     LOGICAL_HEIGHT,
     LOGICAL_WIDTH,
@@ -84,7 +85,7 @@ class WhiteboardApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.report_callback_exception = self._report_exception
-        self.root.title("LAN Collaborative Whiteboard")
+        self.root.title("InkLAN")
         self.root.geometry("1280x800")
         self.root.minsize(1280, 720)
 
@@ -155,9 +156,9 @@ class WhiteboardApp:
         card = ttk.Frame(wrapper, padding=32, relief="solid", borderwidth=1)
         card.pack()
 
-        title = ttk.Label(card, text="LAN Collaborative Whiteboard", font=("Segoe UI", 24, "bold"))
+        title = ttk.Label(card, text=APP_NAME, font=("Segoe UI", 24, "bold"))
         title.pack(pady=(0, 4))
-        subtitle = ttk.Label(card, text="Connect to a server on your LAN", font=("Segoe UI", 11))
+        subtitle = ttk.Label(card, text=APP_SUBTITLE, font=("Segoe UI", 11))
         subtitle.pack(pady=(0, 16))
 
         self.connect_mode = tk.StringVar(value="create")
@@ -529,9 +530,9 @@ class WhiteboardApp:
                 self.state.update_participants(resp["participants"])
             # Track pending none.
 
-        self.root.title(f"LAN Whiteboard - {self.username} ({self.role}) - Room {self.room_code}")
+        self.root.title(f"{APP_NAME} - {self.username} ({self.role}) - Room {self.room_code}")
 
-        self.root.title(f"LAN Whiteboard - {self.username} ({self.role}) - Room {self.room_code}")
+        self.root.title(f"{APP_NAME} - {self.username} ({self.role}) - Room {self.room_code}")
 
         # Persist the reconnect token (never the password).
         try:
@@ -837,7 +838,7 @@ class WhiteboardApp:
         canvas_frame = ttk.Frame(self.main_frame)
         canvas_frame.pack(side="left", fill="both", expand=True)
         self.canvas = tk.Canvas(canvas_frame, bg=self.theme["canvas"],
-                                borderwidth=0, highlightthickness=0)
+                                borderwidth=0, highlightthickness=0, takefocus=1)
         self.canvas.pack(fill="both", expand=True, padx=12, pady=12)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<Button-1>", self._on_press)
@@ -845,6 +846,11 @@ class WhiteboardApp:
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Motion>", self._on_hover)
         self.canvas.bind("<Double-Button-1>", self._on_double_click)
+        self.canvas.bind("<Key>", lambda event: self._on_canvas_key(event))
+        self.canvas.bind("<KeyPress>", lambda event: self._on_canvas_key(event))
+        for _key in ("p", "e", "t", "z", "y"):
+            self.canvas.bind(f"<Key-{_key}>", lambda event: self._on_canvas_key(event))
+            self.canvas.bind(f"<KeyPress-{_key}>", lambda event: self._on_canvas_key(event))
 
         # Right panel.  A fixed width is what stops chat/participant content
         # from resizing the whole rail while someone is drawing.
@@ -947,17 +953,19 @@ class WhiteboardApp:
         self.status_sync = ttk.Label(self.status_bar, text="synced", width=10, anchor="e")
         self.status_sync.pack(side="right", padx=4)
 
-        # Keyboard shortcuts (Control and Command).
+        # Keyboard shortcuts. Single-letter shortcuts are bound to the canvas
+        # only, so typing in a field never triggers a board action. Modifier
+        # shortcuts are global but are ignored while a text widget has focus.
         for mod in ("<Control-", "<Command-"):
-            self.root.bind(f"{mod}p>", lambda _e: self._set_tool("pen"))
-            self.root.bind(f"{mod}e>", lambda _e: self._set_tool("eraser"))
-            self.root.bind(f"{mod}t>", lambda _e: self._toggle_theme())
-            self.root.bind(f"{mod}z>", lambda _e: self._undo())
-            self.root.bind(f"{mod}y>", lambda _e: self._redo())
-        self.root.bind("<Control-Shift-Z>", lambda _e: self._redo())
-        self.root.bind("<Command-Shift-Z>", lambda _e: self._redo())
-        self.root.bind("<Control-Shift-D>", lambda _e: self._toggle_debug_overlay())
-        self.root.bind("<Escape>", lambda _e: self._set_tool("pen"))
+            self.root.bind(f"{mod}p>", lambda e: self._run_shortcut(lambda: self._set_tool("pen"), e))
+            self.root.bind(f"{mod}e>", lambda e: self._run_shortcut(lambda: self._set_tool("eraser"), e))
+            self.root.bind(f"{mod}t>", lambda e: self._run_shortcut(self._toggle_theme, e))
+            self.root.bind(f"{mod}z>", lambda e: self._run_shortcut(self._undo, e))
+            self.root.bind(f"{mod}y>", lambda e: self._run_shortcut(self._redo, e))
+        self.root.bind("<Control-Shift-Z>", lambda e: self._run_shortcut(self._redo, e))
+        self.root.bind("<Command-Shift-Z>", lambda e: self._run_shortcut(self._redo, e))
+        self.root.bind("<Control-Shift-D>", lambda e: self._run_shortcut(self._toggle_debug_overlay, e))
+        self.root.bind("<Escape>", lambda e: self._run_shortcut(lambda: self._set_tool("pen"), e))
 
         # Mouse wheel for width (cross-platform).
         self.canvas.bind("<MouseWheel>", self._on_wheel)
@@ -1035,6 +1043,33 @@ class WhiteboardApp:
             if tip is not None:
                 tip.set_text("Export board as PNG")
         self._update_host_buttons()
+
+    def _shortcut_allowed(self, event=None) -> bool:
+        widget = self.root.focus_get()
+        return widget is self.canvas
+
+    def _run_shortcut(self, handler, event=None):
+        if not self._shortcut_allowed(event):
+            return None
+        try:
+            return handler()
+        except Exception:
+            return None
+
+    def _on_canvas_key(self, event) -> None:
+        if not self._shortcut_allowed(event):
+            return
+        key = (getattr(event, "keysym", "") or "").lower()
+        if key == "p":
+            self._set_tool("pen")
+        elif key == "e":
+            self._set_tool("eraser")
+        elif key == "t":
+            self._toggle_theme()
+        elif key == "z":
+            self._undo()
+        elif key == "y":
+            self._redo()
 
     def _set_tool(self, tool):
         if getattr(self, "_text_entry", None) is not None:
@@ -1797,7 +1832,7 @@ class WhiteboardApp:
                 for u in users:
                     if u.get("name") == self.username and u.get("role") != self.role:
                         self.role = u.get("role", self.role)
-                        self.root.title(f"LAN Whiteboard - {self.username} ({self.role}) - Room {self.room_code}")
+                        self.root.title(f"{APP_NAME} - {self.username} ({self.role}) - Room {self.room_code}")
                         if hasattr(self, "identity_role"):
                             self.identity_role.config(text=self.role)
                         self._update_permissions()
