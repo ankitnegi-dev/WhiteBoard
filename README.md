@@ -1,4 +1,8 @@
 # InkLAN
+![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)
+![GUI](https://img.shields.io/badge/GUI-tkinter-14535F)
+![Transport](https://img.shields.io/badge/Transport-TCP%20sockets-D9622B)
 
 A LAN-based collaborative whiteboard.
 
@@ -94,13 +98,35 @@ No screenshot PNGs are committed yet.
 
 ```mermaid
 flowchart LR
-  C1["Client A"] --> S["InkLANServer"]
-  C2["Client B"] --> S
-  C3["Client C"] --> S
-  S --> R["Room manager"]
-  R --> L["Lock and op log"]
-  R --> O["Objects map"]
-  R --> P["Persistence"]
+  subgraph CL["Client (tkinter)"]
+    UI["UI thread<br/>canvas, toolbar, chat"]
+    ST["Board state<br/>objects, applied seq"]
+    NT["Network thread<br/>send queue, reconnect"]
+    SS["Session store<br/>saved token"]
+    UI --> ST
+    UI <--> NT
+    NT --> SS
+  end
+  subgraph SV["Server"]
+    AC["Accept loop"]
+    H["Handler thread per client<br/>send queue and writer"]
+    M["Monitor thread<br/>heartbeats"]
+    AS["Autosave thread"]
+    RM["Room manager"]
+    subgraph RO["Room"]
+      LK["Room lock"]
+      LG["Op log and seq"]
+      OB["Objects map"]
+      UR["Undo and redo stacks"]
+      CH["Chat history"]
+    end
+    FS[("rooms/*.json")]
+    AC --> H --> RM --> LK --> LG --> OB
+    M --> H
+    AS --> FS
+    OB --> FS
+  end
+  NT <-->|"TCP<br/>length prefixed JSON"| AC
 ```
 
 Clients connect to the server over TCP. The server owns room state and broadcasts stamped operations. TCP was chosen because the project needs reliable, ordered delivery. Rebuilding ordering and retransmission on UDP would add work without benefit on a LAN.
@@ -128,13 +154,19 @@ The server validates every message, checks the sender role, dedupes by op_id, lo
 
 ```mermaid
 sequenceDiagram
-  participant C as Client
+  participant H as Host client
   participant S as Server
-  C->>S: create_room
-  S-->>C: room_created
-  C->>S: join_room
-  S-->>C: join_ok with snapshot
-  S-->>C: participant_list
+  participant G as Second client
+  H->>S: create_room
+  S-->>H: room_created with token and role
+  S-->>H: participant_list
+  G->>S: join_room with room code
+  alt accepted
+    S-->>G: join_ok with snapshot and chat history
+    S-->>H: user_joined and participant_list
+  else denied
+    S-->>G: join_denied with reason
+  end
 ```
 
 `join_room` can return `join_denied` for a bad code, wrong password, locked room, taken name or reserved name. On success the client receives a token, role, color, participants, snapshot, seq and chat history.
@@ -146,12 +178,15 @@ sequenceDiagram
   participant A as Client A
   participant S as Server
   participant B as Client B
+  A->>A: draw shape locally
   A->>S: shape op_id sA
+  B->>S: delete_object op_id dB
+  Note over S: room lock, stamp seq 10 then 11
   S-->>A: shape seq 10
   S-->>B: shape seq 10
-  B->>S: shape op_id sB
-  S-->>A: shape seq 11
-  S-->>B: shape seq 11
+  S-->>A: delete_object seq 11
+  S-->>B: delete_object seq 11
+  Note over B: delete waits for the echo, no local apply
 ```
 
 Additive ops render locally right away and reconcile by op_id. Delete, undo, redo, clear, edit and move apply the server broadcast so the sender and every other client use the same path.
@@ -195,6 +230,21 @@ Only the UI thread touches tkinter. The network thread pushes messages into a qu
 ## Wire protocol
 
 Frame: 4 bytes big endian length, then UTF-8 JSON. Limit: 1 MB.
+```
++----------------+----------------------------+
+| 4 bytes length | N bytes of UTF-8 JSON      |
+| (big endian)   | N is at most 1 MB          |
++----------------+----------------------------+
+```
+
+Example, as sent by a client:
+
+```json
+{"type": "stroke_start", "op_id": "...", "stroke_id": "...",
+ "tool": "pen", "color": "#000000", "width": 2, "x": 10, "y": 20}
+```
+
+The server stamps it and broadcasts the same message with `"seq": 1, "user": "alice", "ts": 1794050552.89` added.
 
 Message groups:
 - Connection and session: create_room, join_room, reconnect, leave, ping, pong, error.
@@ -269,7 +319,7 @@ The client has no command line options. The server options are:
 - `--autosave-interval` seconds between autosave scans, default `30.0`
 - `--rate-limit` max ops per second per client, default `60.0`
 
-Find the server LAN IP with `ipconfig` on Windows or `ip addr` on Linux. Open port 5050 in the firewall. Windows: `netsh advfirewall firewall add rule name="InkLAN" dir=in action=allow protocol=TCP localport=5050`. Linux: `sudo ufw allow 5050/tcp`.
+Find the server LAN IP with `ipconfig` on Windows or `ip addr` on Linux. Open port 5050 in the firewall. Windows: `netsh advfirewall firewall add rule name="Whiteboard TCP 5050" dir=in action=allow protocol=TCP localport=5050`. Linux: `sudo ufw allow 5050/tcp`.
 
 ## Using the app
 
@@ -284,14 +334,19 @@ Find the server LAN IP with `ipconfig` on Windows or `ip addr` on Linux. Open po
 
 ## Project structure
 
-- `protocol.py`: framing and constants
-- `server/`: server, room, persistence
-- `client/`: UI, network, state, tools, session store
-- `tests/`: automated tests
-- `docs/`: protocol, report, build guide
-- `build/`: build scripts
-- `shapes_geometry.py`: shared shape geometry
-
+```
+.
+|-- protocol.py            framing and constants
+|-- platform_utils.py      OS helpers
+|-- shapes_geometry.py     shared shape geometry
+|-- server/                main, client_handler, room, room_manager, auth, persistence
+|-- client/                main, ui, net, state, tools, session_store, app_info
+|-- tests/                 automated tests and smoke script
+|-- docs/                  protocol, report, build guide, diagrams
+|-- build/                 build and run scripts for Windows and Linux
+|-- requirements.txt       runtime dependencies
+|-- requirements-dev.txt   test and report tooling
+```
 ## Testing
 
 Commands:

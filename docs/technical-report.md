@@ -315,7 +315,7 @@ Manual checks:
 3. From source on Windows: create a venv, install requirements, run `python server/main.py` and `python -m client.main`.
 4. From source on Linux: install `python3-tk`, create a venv, install requirements, run the same commands.
 5. Find the server LAN IP with `ipconfig` on Windows or `ip addr` on Linux.
-6. Open port 5050 in the firewall. Windows: `netsh advfirewall firewall add rule name="InkLAN" dir=in action=allow protocol=TCP localport=5050`. Linux: `sudo ufw allow 5050/tcp`.
+6. Open port 5050 in the firewall. Windows: `netsh advfirewall firewall add rule name="Whiteboard TCP 5050" dir=in action=allow protocol=TCP localport=5050`. Linux: `sudo ufw allow 5050/tcp`.
 7. Start the server. Options include `--host`, `--port`, `--rooms-dir`, `--grace-period`, `--autosave-interval`, and `--rate-limit`.
 8. Create a room in the client. Share the room code and optional password.
 9. Join with server IP, port, username and room code.
